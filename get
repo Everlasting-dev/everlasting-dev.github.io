@@ -103,13 +103,13 @@ function Get-HowToText {
 On a PC that has internet, open PowerShell and paste:
   irm $($script:SourceUrl) | iex
 Choose [2] Get $($script:AppName).
-The first time, that installs $($script:AppName). The next time, it repairs $($script:AppName)
-and does not delete your files.
+The first time, that installs $($script:AppName).
+After that, type $($script:CommandName), or choose [2] Open $($script:AppName).
 
 To send
   1. Copy the files into Documents\$($script:AppName)\Outbox.
   2. Run: $($script:CommandName)
-  3. Choose Send files. Uncheck anything you do not want. Confirm.
+  3. Choose 1, Send files. Uncheck anything you do not want. Confirm.
   4. Leave this window open. Read the PIN to the other PC.
 
 To receive
@@ -332,8 +332,9 @@ function Invoke-GetSlipFromLauncher {
         if (Complete-SlipSetup -DisplayName $name) {
             Write-Host ''
             Write-Host "$($script:AppName) is installed." -ForegroundColor Green
-            Write-Host 'Next time, type this in a new PowerShell window:' -ForegroundColor Green
+            Write-Host 'Next time, open a new PowerShell window and type:' -ForegroundColor Green
             Write-Host "  $($script:CommandName)" -ForegroundColor Green
+            Write-Host 'Send files is the first choice.' -ForegroundColor Green
             Show-NetworkWarning
             Write-Host ''
             Write-Host (Get-HowToText)
@@ -345,24 +346,7 @@ function Invoke-GetSlipFromLauncher {
         return
     }
 
-    Write-Host "$($script:AppName) is already on this PC." -ForegroundColor Yellow
-    Write-Host ''
-    Write-Host 'Repair puts the firewall rules and the command back,'
-    Write-Host 'and recreates Outbox or Inbox if those folders are missing.'
-    Write-Host ''
-    Write-Host 'Repair will not delete files in Outbox or Inbox.' -ForegroundColor Green
-    Write-Host ''
-    $answer = Read-Host '[Y] Repair  [N] Back'
-    if ($answer -notmatch '^[Yy]') { return }
-    Write-Host ''
-    if (Complete-SlipSetup -DisplayName $null) {
-        Write-Host ''
-        Write-Host 'Repair finished. Your Outbox and Inbox files are still there.' -ForegroundColor Green
-        Wait-Enter
-        Show-SlipMenu -CanReturn
-    } else {
-        Wait-Enter
-    }
+    Show-SlipMenu -CanReturn
 }
 
 function Show-RepairScreen {
@@ -568,8 +552,14 @@ function Send-HttpText {
     Write-HttpBytes -Stream $Stream -Head $head -Body $bytes
 }
 
+function Write-PercentLine {
+    param([string]$Label, [int]$Percent)
+    $text = '{0,-44} {1,3}%' -f $Label, $Percent
+    Write-Host ("`r" + $text) -NoNewline
+}
+
 function Send-FileResponse {
-    param($Stream, [string]$FilePath, [string]$DownloadName)
+    param($Stream, [string]$FilePath, [string]$DownloadName, [switch]$Quiet)
     $len = [long](Get-Item -LiteralPath $FilePath).Length
     $ascii = ($DownloadName -replace '[^\x20-\x7E]', '_') -replace '"', ''
     $star = [Uri]::EscapeDataString($DownloadName)
@@ -577,12 +567,24 @@ function Send-FileResponse {
     $headBytes = [Text.Encoding]::ASCII.GetBytes($head)
     $Stream.Write($headBytes, 0, $headBytes.Length)
     $fs = [IO.File]::Open($FilePath, 'Open', 'Read', 'ReadWrite')
+    $last = -1
     try {
         $buf = New-Object byte[] (1MB)
+        $sent = 0L
         while (($n = $fs.Read($buf, 0, $buf.Length)) -gt 0) {
             $Stream.Write($buf, 0, $n)
+            $sent += $n
+            if (-not $Quiet -and $len -gt 0) {
+                $pct = [int](($sent * 100) / $len)
+                if ($pct -gt 100) { $pct = 100 }
+                if ($pct -ne $last) {
+                    Write-PercentLine -Label ("Sending " + (Get-ShortText $DownloadName 32)) -Percent $pct
+                    $last = $pct
+                }
+            }
         }
         $Stream.Flush()
+        if (-not $Quiet -and $last -ge 0) { Write-Host '' }
     } finally {
         $fs.Dispose()
     }
@@ -600,7 +602,7 @@ function Test-PinMatch {
 }
 
 function Handle-HttpClient {
-    param($Client, [string]$Token, [string]$Pin, [string]$FilePath, [string]$DownloadName)
+    param($Client, [string]$Token, [string]$Pin, [string]$FilePath, [string]$DownloadName, [switch]$Quiet)
     $Client.ReceiveTimeout = 20000
     $stream = $Client.GetStream()
     $raw = Read-HttpHeaders $stream
@@ -645,7 +647,7 @@ function Handle-HttpClient {
         Send-HttpText $stream 401 'Unauthorized' 'text/plain' 'Wrong PIN'
         return $false
     }
-    Send-FileResponse $stream $FilePath $DownloadName
+    Send-FileResponse -Stream $stream -FilePath $FilePath -DownloadName $DownloadName -Quiet:$Quiet
     return $true
 }
 
@@ -737,7 +739,7 @@ function Start-ShareServer {
             }
             $client = $listener.AcceptTcpClient()
             try {
-                $ok = Handle-HttpClient $client $token $pin $FilePath $DownloadName
+                $ok = Handle-HttpClient -Client $client -Token $token -Pin $pin -FilePath $FilePath -DownloadName $DownloadName -Quiet:$Quiet
                 if ($ok) { $done = $true }
             } catch {
             } finally {
@@ -976,7 +978,7 @@ function Get-UniqueFilePath {
 }
 
 function Save-RemoteFile {
-    param([string]$Url, [string]$Directory)
+    param([string]$Url, [string]$Directory, [switch]$Quiet)
     Add-Type -AssemblyName System.Net.Http
     if (-not (Test-Path -LiteralPath $Directory)) {
         New-Item -ItemType Directory -Force -Path $Directory | Out-Null
@@ -1001,22 +1003,26 @@ function Save-RemoteFile {
         $dest = Get-UniqueFilePath $Directory $name
         $inputStream = $resp.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
         $output = [IO.File]::Create($dest)
+        $last = -1
         try {
             $buf = New-Object byte[] (1MB)
             $readTotal = 0L
             while (($n = $inputStream.Read($buf, 0, $buf.Length)) -gt 0) {
                 $output.Write($buf, 0, $n)
                 $readTotal += $n
-                if ($total -and $total -gt 0) {
+                if (-not $Quiet -and $total -and $total -gt 0) {
                     $pct = [int](($readTotal * 100) / $total)
                     if ($pct -gt 100) { $pct = 100 }
-                    Write-Progress -Activity 'Receiving' -Status $name -PercentComplete $pct
+                    if ($pct -ne $last) {
+                        Write-PercentLine -Label ("Receiving " + (Get-ShortText $name 32)) -Percent $pct
+                        $last = $pct
+                    }
                 }
             }
+            if (-not $Quiet -and $last -ge 0) { Write-Host '' }
         } finally {
             $output.Dispose()
             $inputStream.Dispose()
-            Write-Progress -Activity 'Receiving' -Completed
         }
         return $dest
     } finally {
@@ -1080,19 +1086,10 @@ function Show-ReceiveFiles {
     }
 }
 
-function Show-SlipMenu {
-    param([switch]$CanReturn)
+function Show-MoreMenu {
     while ($true) {
         Clear-Host
-        $ips = @(Get-LanIPv4)
-        $ipText = if ($ips.Count -gt 0) { $ips[0] } else { 'no LAN address' }
-        $outCount = @(Get-OutboxItems).Count
-        $ready = (Test-SlipInstalled) -and (Test-FirewallRule $script:RuleTcp) -and (Test-FirewallRule $script:RuleUdp)
-        Write-Host $script:AppName -ForegroundColor Cyan
-        Write-Host "Windows name: $env:COMPUTERNAME"
-        Write-Host ("Shown as: {0}    {1}" -f (Get-DisplayName), $ipText)
-        if ($ready) { Write-Host "Setup: ready   Outbox: $outCount files" -ForegroundColor Green }
-        else { Write-Host "Setup: not ready   Outbox: $outCount files" -ForegroundColor Yellow }
+        Write-Host 'More' -ForegroundColor Cyan
         Write-Host ''
         Write-Host '  1  How to send and receive'
         Write-Host '  2  Status'
@@ -1100,10 +1097,7 @@ function Show-SlipMenu {
         Write-Host '  4  Remove'
         Write-Host '  5  Rename this PC'
         Write-Host '  6  Check connection'
-        Write-Host '  7  Send files'
-        Write-Host '  8  Receive files'
-        Write-Host '  9  Open Outbox folder'
-        if ($CanReturn) { Write-Host '  0  Back' } else { Write-Host '  0  Quit' }
+        Write-Host '  0  Back'
         Write-Host ''
         $choice = Read-Host 'Choice'
         if ($choice -eq '' -and [Console]::IsInputRedirected) { return }
@@ -1114,9 +1108,35 @@ function Show-SlipMenu {
             '4' { Invoke-RemoveSlip }
             '5' { Rename-ThisPc }
             '6' { Show-CheckConnection }
-            '7' { Show-SendFiles }
-            '8' { Show-ReceiveFiles }
-            '9' { Open-Folder (Get-OutboxPath) }
+            '0' { return }
+        }
+    }
+}
+
+function Show-SlipMenu {
+    param([switch]$CanReturn)
+    while ($true) {
+        Clear-Host
+        $ips = @(Get-LanIPv4)
+        $ipText = if ($ips.Count -gt 0) { $ips[0] } else { 'no LAN address' }
+        $outCount = @(Get-OutboxItems).Count
+        Write-Host $script:AppName -ForegroundColor Cyan
+        Write-Host ("Shown as: {0}    {1}" -f (Get-DisplayName), $ipText)
+        Write-Host "Outbox: $outCount files"
+        Write-Host ''
+        Write-Host '  1  Send files'
+        Write-Host '  2  Receive files'
+        Write-Host '  3  Open Outbox'
+        Write-Host '  4  More'
+        if ($CanReturn) { Write-Host '  0  Back' } else { Write-Host '  0  Quit' }
+        Write-Host ''
+        $choice = Read-Host 'Choice'
+        if ($choice -eq '' -and [Console]::IsInputRedirected) { return }
+        switch ($choice) {
+            '1' { Show-SendFiles }
+            '2' { Show-ReceiveFiles }
+            '3' { Open-Folder (Get-OutboxPath) }
+            '4' { Show-MoreMenu }
             '0' { return }
         }
     }
@@ -1212,14 +1232,18 @@ function Show-Launcher {
         else { Write-Host "$($script:AppName): not installed" -ForegroundColor Yellow }
         Write-Host ''
         Write-Host '  [1] Get Octane'
-        Write-Host "  [2] Get $($script:AppName)"
+        if (Test-SlipInstalled) { Write-Host "  [2] Open $($script:AppName)" }
+        else { Write-Host "  [2] Get $($script:AppName)" }
         Write-Host '  [3] Quit'
         Write-Host ''
         $choice = Read-Host 'Choice'
         if ($choice -eq '' -and [Console]::IsInputRedirected) { return }
         switch ($choice) {
             '1' { Invoke-GetOctane }
-            '2' { Invoke-GetSlipFromLauncher }
+            '2' {
+                if (Test-SlipInstalled) { Show-SlipMenu -CanReturn }
+                else { Invoke-GetSlipFromLauncher }
+            }
             '3' { return }
         }
     }
@@ -1305,7 +1329,7 @@ switch ($script:Opt.Entry) {
             $destDir = if ($script:Opt.OutDir) { $script:Opt.OutDir } else { Get-InboxPath }
             $url = "http://$($script:Opt.Address):$($script:Opt.Port)/d/$($script:Opt.Token)?pin=$([Uri]::EscapeDataString($script:Opt.Pin))"
             try {
-                $saved = Save-RemoteFile -Url $url -Directory $destDir
+                $saved = Save-RemoteFile -Url $url -Directory $destDir -Quiet
                 [Console]::Out.WriteLine($saved)
                 Exit-Slip 0
             } catch {
