@@ -1,25 +1,1319 @@
-# Download the latest Octane installer, install it, then delete the setup files.
-$ErrorActionPreference = 'Stop'
-$repo = 'Everlasting-dev/octane'
-$dir = Join-Path $env:TEMP 'octane-setup'
-New-Item -ItemType Directory -Force -Path $dir | Out-Null
-$setupPath = Join-Path $dir 'Octane-Setup.exe'
+# Slip — launcher (Get Octane / Get Slip) and LAN file transfer.
+# Published as https://everlasting-dev.github.io/get
+# Rename the app in $script:AppName. The command, folders, and firewall rules follow it.
+$script:AppName = 'Slip'
+$script:CommandName = $script:AppName.ToLowerInvariant()
+$script:SourceUrl = 'https://everlasting-dev.github.io/get'
+$script:BeaconPort = 47654
+$script:PortFirst = 8787
+$script:PortLast = 8796
+$script:RawArgs = @($args)
 
-try {
-  $release = Invoke-RestMethod -Headers @{ 'User-Agent' = 'octane-download' } -Uri "https://api.github.com/repos/$repo/releases/latest"
-  $setup = $release.assets | Where-Object { $_.name -like 'Octane-Setup-*.exe' } | Select-Object -First 1
-  if (-not $setup) { throw 'No Octane installer is attached to the latest release.' }
+$script:RuleTcp = "$($script:AppName) TCP"
+$script:RuleUdp = "$($script:AppName) Discovery"
+$script:BeaconPrefix = $script:AppName.ToUpperInvariant() + '1'
 
-  Write-Host "Downloading $($setup.name)..."
-  Invoke-WebRequest -Uri $setup.browser_download_url -OutFile $setupPath
-
-  Write-Host 'Installing Octane...'
-  $proc = Start-Process -FilePath $setupPath -ArgumentList '/S' -Wait -PassThru
-  if ($proc.ExitCode -ne 0) { throw "Installer exited with code $($proc.ExitCode)." }
-  Write-Host 'Octane installed.'
+function Get-SlipRoot {
+    Join-Path (Join-Path $env:USERPROFILE 'Documents') $script:AppName
 }
-finally {
-  if (Test-Path -LiteralPath $dir) {
-    Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
-  }
+function Get-OutboxPath { Join-Path (Get-SlipRoot) 'Outbox' }
+function Get-InboxPath { Join-Path (Get-SlipRoot) 'Inbox' }
+function Get-HowToPath { Join-Path (Get-SlipRoot) 'HOWTO.txt' }
+function Get-NamePath { Join-Path (Get-SlipRoot) 'name.txt' }
+function Get-InstalledPath { Join-Path (Get-SlipRoot) 'installed.txt' }
+
+function Test-SlipInstalled {
+    Test-Path -LiteralPath (Get-InstalledPath)
+}
+
+function Test-IsAdmin {
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($id)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Format-ByteSize {
+    param([long]$Bytes)
+    if ($Bytes -ge 1GB) { return ('{0:N1} GB' -f ($Bytes / 1GB)) }
+    if ($Bytes -ge 1MB) { return ('{0:N1} MB' -f ($Bytes / 1MB)) }
+    if ($Bytes -ge 1KB) { return ('{0:N1} KB' -f ($Bytes / 1KB)) }
+    return "$Bytes B"
+}
+
+function Get-ShortText {
+    param([string]$Text, [int]$Max = 42)
+    if ([string]::IsNullOrEmpty($Text)) { return '' }
+    if ($Text.Length -le $Max) { return $Text }
+    return $Text.Substring(0, $Max - 3) + '...'
+}
+
+function Wait-Enter {
+    Write-Host ''
+    Write-Host 'Press Enter to continue.' -ForegroundColor DarkGray
+    [void](Read-Host)
+}
+
+function Get-LanIPv4 {
+    $ips = @()
+    try {
+        $ips = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop |
+            Where-Object {
+                $_.IPAddress -notlike '127.*' -and
+                $_.IPAddress -notlike '169.254.*' -and
+                $_.PrefixOrigin -ne 'WellKnown'
+            } |
+            Select-Object -ExpandProperty IPAddress)
+    } catch {
+        $ips = @()
+    }
+    if ($ips.Count -eq 0) {
+        try {
+            $ips = @([Net.Dns]::GetHostAddresses([Net.Dns]::GetHostName()) |
+                Where-Object {
+                    $_.AddressFamily -eq 'InterNetwork' -and
+                    $_.ToString() -notlike '127.*' -and
+                    $_.ToString() -notlike '169.254.*'
+                } |
+                ForEach-Object { $_.ToString() })
+        } catch {
+            $ips = @()
+        }
+    }
+    return $ips
+}
+
+function Get-DisplayName {
+    $path = Get-NamePath
+    if (Test-Path -LiteralPath $path) {
+        $name = Get-Content -LiteralPath $path -Raw -ErrorAction SilentlyContinue
+        if ($name) { $name = $name.Trim() }
+        if ($name) { return $name }
+    }
+    return $env:COMPUTERNAME
+}
+
+function ConvertTo-BeaconField {
+    param([string]$Text)
+    if (-not $Text) { return '' }
+    return (($Text -replace '[|\r\n]', ' ').Trim())
+}
+
+function Get-HowToText {
+@"
+On a PC that has internet, open PowerShell and paste:
+  irm $($script:SourceUrl) | iex
+Choose [2] Get $($script:AppName).
+The first time, that installs $($script:AppName). The next time, it repairs $($script:AppName)
+and does not delete your files.
+
+To send
+  1. Copy the files into Documents\$($script:AppName)\Outbox.
+  2. Run: $($script:CommandName)
+  3. Choose Send files. Uncheck anything you do not want. Confirm.
+  4. Leave this window open. Read the PIN to the other PC.
+
+To receive
+  1. Run: $($script:CommandName)
+  2. Choose Receive files. Pick the other PC. Type the PIN.
+  3. Files are saved in Documents\$($script:AppName)\Inbox.
+
+Both PCs must be on the same Wi-Fi or LAN. The names you see are
+display names, not the Windows computer names.
+Close the sender only after the receiver says the download finished.
+"@
+}
+
+function Get-SendStepsText {
+@"
+To send
+  1. Copy the files into Documents\$($script:AppName)\Outbox.
+  2. Uncheck anything you do not want.
+  3. Confirm the list.
+  4. Leave this window open and read the PIN to the other PC.
+"@
+}
+
+function Get-ReceiveStepsText {
+@"
+To receive
+  1. Pick the other PC.
+  2. Type the PIN they read out.
+  3. Files are saved in Documents\$($script:AppName)\Inbox.
+"@
+}
+
+function Get-ProfilePaths {
+    $doc = Join-Path $env:USERPROFILE 'Documents'
+    $win = Join-Path (Join-Path $doc 'WindowsPowerShell') 'Microsoft.PowerShell_profile.ps1'
+    $ps7 = Join-Path (Join-Path $doc 'PowerShell') 'Microsoft.PowerShell_profile.ps1'
+    $list = @($win)
+    if (Test-Path -LiteralPath $ps7) { $list += $ps7 }
+    return @($list | Select-Object -Unique)
+}
+
+function Get-SlipFunctionBlock {
+@"
+# >>> $($script:CommandName) >>>
+function $($script:CommandName) {
+    `$tmp = Join-Path `$env:TEMP '$($script:CommandName)-get.ps1'
+    Invoke-RestMethod -Uri '$($script:SourceUrl)' -OutFile `$tmp
+    try {
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File `$tmp menu @args
+    } finally {
+        Remove-Item -LiteralPath `$tmp -Force -ErrorAction SilentlyContinue
+    }
+}
+# <<< $($script:CommandName) <<<
+"@
+}
+
+function Set-ProfileBlock {
+    $block = (Get-SlipFunctionBlock).Trim() + "`r`n"
+    $pattern = "(?s)# >>> $($script:CommandName) >>>.*?# <<< $($script:CommandName) <<<\s*"
+    foreach ($path in (Get-ProfilePaths)) {
+        $dir = Split-Path -Parent $path
+        if (-not (Test-Path -LiteralPath $dir)) {
+            New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        }
+        $existing = ''
+        if (Test-Path -LiteralPath $path) {
+            $existing = [IO.File]::ReadAllText($path)
+        }
+        if ($existing -match $pattern) {
+            $updated = [regex]::Replace($existing, $pattern, $block)
+        } else {
+            $prefix = $existing
+            if ($prefix -and -not $prefix.EndsWith("`n")) { $prefix += "`r`n" }
+            if ($prefix) { $prefix += "`r`n" }
+            $updated = $prefix + $block
+        }
+        [IO.File]::WriteAllText($path, $updated)
+    }
+}
+
+function Remove-ProfileBlock {
+    $pattern = "(?s)# >>> $($script:CommandName) >>>.*?# <<< $($script:CommandName) <<<\s*"
+    foreach ($path in (Get-ProfilePaths)) {
+        if (-not (Test-Path -LiteralPath $path)) { continue }
+        $existing = [IO.File]::ReadAllText($path)
+        if ($existing -notmatch $pattern) { continue }
+        $updated = [regex]::Replace($existing, $pattern, '')
+        [IO.File]::WriteAllText($path, $updated)
+    }
+}
+
+function Test-FirewallRule {
+    param([string]$Name)
+    try {
+        $rules = @(Get-NetFirewallRule -DisplayName $Name -ErrorAction Stop | Where-Object { $_.DisplayName -eq $Name })
+        return ($rules.Count -gt 0)
+    } catch {
+        return $false
+    }
+}
+
+function Install-FirewallRules {
+    if (-not (Test-FirewallRule $script:RuleTcp)) {
+        New-NetFirewallRule -DisplayName $script:RuleTcp -Direction Inbound -Action Allow -Protocol TCP -LocalPort "$($script:PortFirst)-$($script:PortLast)" -Profile Private | Out-Null
+    }
+    if (-not (Test-FirewallRule $script:RuleUdp)) {
+        New-NetFirewallRule -DisplayName $script:RuleUdp -Direction Inbound -Action Allow -Protocol UDP -LocalPort $script:BeaconPort -Profile Private | Out-Null
+    }
+}
+
+function Uninstall-FirewallRules {
+    foreach ($name in @($script:RuleTcp, $script:RuleUdp)) {
+        if (Test-FirewallRule $name) {
+            Remove-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Invoke-ElevatedEntry {
+    param([string]$Entry)
+    if ($PSCommandPath) {
+        $argList = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" $Entry"
+    } else {
+        $cmd = "`$env:SLIP_ENTRY='$Entry'; iex ((Invoke-RestMethod -Uri '$($script:SourceUrl)').ToString())"
+        $argList = "-NoProfile -ExecutionPolicy Bypass -Command `"$cmd`""
+    }
+    try {
+        $proc = Start-Process -FilePath powershell.exe -Verb RunAs -Wait -PassThru -ArgumentList $argList
+        if ($proc -and $null -ne $proc.ExitCode) { return [int]$proc.ExitCode }
+        return 1
+    } catch {
+        return 1
+    }
+}
+
+function Ensure-SlipFiles {
+    param([string]$DisplayName)
+    foreach ($dir in @((Get-SlipRoot), (Get-OutboxPath), (Get-InboxPath))) {
+        if (-not (Test-Path -LiteralPath $dir)) {
+            New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        }
+    }
+    Set-Content -LiteralPath (Get-HowToPath) -Value (Get-HowToText) -Encoding ASCII
+    if ($DisplayName) {
+        Set-Content -LiteralPath (Get-NamePath) -Value $DisplayName.Trim() -Encoding ASCII
+    } elseif (-not (Test-Path -LiteralPath (Get-NamePath))) {
+        Set-Content -LiteralPath (Get-NamePath) -Value $env:COMPUTERNAME -Encoding ASCII
+    }
+    Set-ProfileBlock
+}
+
+function Complete-SlipSetup {
+    param([string]$DisplayName)
+    Ensure-SlipFiles -DisplayName $DisplayName
+    $ready = (Test-FirewallRule $script:RuleTcp) -and (Test-FirewallRule $script:RuleUdp)
+    if (-not $ready) {
+        if (Test-IsAdmin) {
+            Install-FirewallRules
+        } else {
+            Write-Host 'Windows needs approval to allow this app on private networks.' -ForegroundColor Yellow
+            $code = Invoke-ElevatedEntry -Entry 'firewall'
+            if ($code -ne 0) {
+                Write-Host 'Firewall rules were not added. Setup is not finished.' -ForegroundColor Red
+                return $false
+            }
+        }
+    }
+    $ready = (Test-FirewallRule $script:RuleTcp) -and (Test-FirewallRule $script:RuleUdp)
+    if (-not $ready) {
+        Write-Host 'Firewall rules are still missing. Setup is not finished.' -ForegroundColor Red
+        return $false
+    }
+    Set-Content -LiteralPath (Get-InstalledPath) -Value (Get-Date -Format 'o') -Encoding ASCII
+    return $true
+}
+
+function Read-CleanName {
+    param([string]$Fallback)
+    $entered = Read-Host "Display name (Enter keeps $Fallback)"
+    if ([string]::IsNullOrWhiteSpace($entered)) { return $Fallback }
+    $clean = ($entered -replace '[|\r\n]', ' ').Trim()
+    if ($clean.Length -gt 40) { $clean = $clean.Substring(0, 40).Trim() }
+    if (-not $clean) { return $Fallback }
+    return $clean
+}
+
+function Show-NetworkWarning {
+    try {
+        $profiles = @(Get-NetConnectionProfile -ErrorAction Stop | Where-Object {
+            $_.NetworkCategory -ne 'Private' -and $_.NetworkCategory -ne 'DomainAuthenticated'
+        })
+        foreach ($item in $profiles) {
+            Write-Host "This network ($($item.Name)) is $($item.NetworkCategory). Firewall rules apply to Private networks." -ForegroundColor Yellow
+        }
+    } catch {}
+}
+
+function Invoke-GetSlipFromLauncher {
+    $installed = Test-SlipInstalled
+    Clear-Host
+    Write-Host "Get $($script:AppName)" -ForegroundColor Cyan
+    Write-Host ''
+    Write-Host "Windows name: $env:COMPUTERNAME"
+    Write-Host ("Shown to other PCs as: " + (Get-DisplayName))
+    Write-Host ''
+    if (-not $installed) {
+        Write-Host "$($script:AppName) is not on this PC yet." -ForegroundColor Yellow
+        Write-Host ''
+        Write-Host "Install will allow $($script:AppName) on private networks, create"
+        Write-Host "Documents\$($script:AppName)\Outbox and Inbox, save the how-to,"
+        Write-Host "and add the command: $($script:CommandName)"
+        Write-Host ''
+        Write-Host 'Nothing of yours is deleted.'
+        Write-Host ''
+        $name = Read-CleanName -Fallback $env:COMPUTERNAME
+        $answer = Read-Host '[Y] Install  [N] Back'
+        if ($answer -notmatch '^[Yy]') { return }
+        Write-Host ''
+        if (Complete-SlipSetup -DisplayName $name) {
+            Write-Host ''
+            Write-Host "$($script:AppName) is installed." -ForegroundColor Green
+            Write-Host 'Next time, type this in a new PowerShell window:' -ForegroundColor Green
+            Write-Host "  $($script:CommandName)" -ForegroundColor Green
+            Show-NetworkWarning
+            Write-Host ''
+            Write-Host (Get-HowToText)
+            Wait-Enter
+            Show-SlipMenu -CanReturn
+        } else {
+            Wait-Enter
+        }
+        return
+    }
+
+    Write-Host "$($script:AppName) is already on this PC." -ForegroundColor Yellow
+    Write-Host ''
+    Write-Host 'Repair puts the firewall rules and the command back,'
+    Write-Host 'and recreates Outbox or Inbox if those folders are missing.'
+    Write-Host ''
+    Write-Host 'Repair will not delete files in Outbox or Inbox.' -ForegroundColor Green
+    Write-Host ''
+    $answer = Read-Host '[Y] Repair  [N] Back'
+    if ($answer -notmatch '^[Yy]') { return }
+    Write-Host ''
+    if (Complete-SlipSetup -DisplayName $null) {
+        Write-Host ''
+        Write-Host 'Repair finished. Your Outbox and Inbox files are still there.' -ForegroundColor Green
+        Wait-Enter
+        Show-SlipMenu -CanReturn
+    } else {
+        Wait-Enter
+    }
+}
+
+function Show-RepairScreen {
+    Clear-Host
+    Write-Host 'Repair' -ForegroundColor Cyan
+    Write-Host ''
+    Write-Host "Windows name: $env:COMPUTERNAME"
+    Write-Host ("Shown to other PCs as: " + (Get-DisplayName))
+    Write-Host ''
+    Write-Host 'Repair puts the firewall rules and the command back,'
+    Write-Host 'and recreates Outbox or Inbox if those folders are missing.'
+    Write-Host ''
+    Write-Host 'Repair will not delete files in Outbox or Inbox.' -ForegroundColor Green
+    Write-Host ''
+    $answer = Read-Host '[Y] Repair  [N] Back'
+    if ($answer -notmatch '^[Yy]') { return }
+    Write-Host ''
+    if (Complete-SlipSetup -DisplayName $null) {
+        Write-Host 'Repair finished. Your Outbox and Inbox files are still there.' -ForegroundColor Green
+    }
+    Wait-Enter
+}
+
+function Invoke-RemoveSlip {
+    Clear-Host
+    Write-Host 'Remove' -ForegroundColor Cyan
+    Write-Host ''
+    Write-Host "This removes the $($script:AppName) firewall rules and the $($script:CommandName) command."
+    Write-Host 'Outbox, Inbox, and the how-to stay on disk. Files are not deleted.' -ForegroundColor Green
+    Write-Host ''
+    $answer = Read-Host '[Y] Remove  [N] Back'
+    if ($answer -notmatch '^[Yy]') { return }
+    Remove-ProfileBlock
+    if ((Test-FirewallRule $script:RuleTcp) -or (Test-FirewallRule $script:RuleUdp)) {
+        if (Test-IsAdmin) {
+            Uninstall-FirewallRules
+        } else {
+            Write-Host 'Windows needs approval to remove the firewall rules.' -ForegroundColor Yellow
+            [void](Invoke-ElevatedEntry -Entry 'unfirewall')
+        }
+    }
+    Write-Host ''
+    if ((Test-FirewallRule $script:RuleTcp) -or (Test-FirewallRule $script:RuleUdp)) {
+        Write-Host 'Firewall rules are still present.' -ForegroundColor Red
+    } else {
+        Write-Host 'Firewall rules and the command are removed. Your files are still there.' -ForegroundColor Green
+    }
+    Wait-Enter
+}
+
+function Show-Status {
+    Clear-Host
+    Write-Host 'Status' -ForegroundColor Cyan
+    Write-Host ''
+    Write-Host "Windows name: $env:COMPUTERNAME"
+    Write-Host ("Shown as:     " + (Get-DisplayName))
+    $ips = @(Get-LanIPv4)
+    if ($ips.Count -eq 0) { Write-Host 'LAN address:  none' }
+    else { Write-Host ("LAN address:  " + ($ips -join ', ')) }
+    Write-Host ''
+    if (Test-SlipInstalled) { Write-Host 'Setup marker: present' -ForegroundColor Green }
+    else { Write-Host 'Setup marker: not installed' -ForegroundColor Yellow }
+    foreach ($rule in @($script:RuleTcp, $script:RuleUdp)) {
+        if (Test-FirewallRule $rule) { Write-Host "Firewall:     $rule  ok" -ForegroundColor Green }
+        else { Write-Host "Firewall:     $rule  missing" -ForegroundColor Yellow }
+    }
+    Show-NetworkWarning
+    Write-Host ''
+    foreach ($pair in @(
+        @{ Label = 'Outbox'; Path = (Get-OutboxPath) },
+        @{ Label = 'Inbox'; Path = (Get-InboxPath) }
+    )) {
+        if (Test-Path -LiteralPath $pair.Path) {
+            $files = @(Get-ChildItem -LiteralPath $pair.Path -Force -File -ErrorAction SilentlyContinue)
+            $sum = 0L
+            foreach ($file in $files) { $sum += [long]$file.Length }
+            Write-Host ("{0}: {1}" -f $pair.Label, $pair.Path)
+            Write-Host ("       {0} files, {1}" -f $files.Count, (Format-ByteSize $sum))
+        } else {
+            Write-Host ("{0}: missing  {1}" -f $pair.Label, $pair.Path) -ForegroundColor Yellow
+        }
+    }
+    Wait-Enter
+}
+
+function Rename-ThisPc {
+    Clear-Host
+    Write-Host 'Rename this PC' -ForegroundColor Cyan
+    Write-Host ''
+    Write-Host "Windows name stays: $env:COMPUTERNAME"
+    Write-Host ("Shown as: " + (Get-DisplayName))
+    Write-Host 'This only changes the name other PCs see.'
+    Write-Host ''
+    $name = Read-CleanName -Fallback (Get-DisplayName)
+    $root = Get-SlipRoot
+    if (-not (Test-Path -LiteralPath $root)) {
+        New-Item -ItemType Directory -Force -Path $root | Out-Null
+    }
+    Set-Content -LiteralPath (Get-NamePath) -Value $name -Encoding ASCII
+    Write-Host ''
+    Write-Host "Other PCs will see: $name ($env:COMPUTERNAME)" -ForegroundColor Green
+    Wait-Enter
+}
+
+function Show-HowTo {
+    Clear-Host
+    Write-Host 'How to send and receive' -ForegroundColor Cyan
+    Write-Host ''
+    Write-Host (Get-HowToText)
+    Wait-Enter
+}
+
+function Get-OutboxItems {
+    $path = Get-OutboxPath
+    if (-not (Test-Path -LiteralPath $path)) { return @() }
+    return @(Get-ChildItem -LiteralPath $path -Force | Where-Object { $_.Name -notin @('desktop.ini', 'Thumbs.db') })
+}
+
+function Get-TreeSize {
+    param($Item)
+    if (-not $Item.PSIsContainer) { return [long]$Item.Length }
+    $sum = (Get-ChildItem -LiteralPath $Item.FullName -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
+    if (-not $sum) { return 0L }
+    return [long]$sum
+}
+
+function Open-Folder {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) {
+        New-Item -ItemType Directory -Force -Path $Path | Out-Null
+    }
+    Start-Process explorer.exe -ArgumentList $Path
+}
+
+function New-SendPayload {
+    param($Items)
+    $files = @($Items | Where-Object { -not $_.PSIsContainer })
+    $dirs = @($Items | Where-Object { $_.PSIsContainer })
+    if ($files.Count -eq 1 -and $dirs.Count -eq 0) {
+        return @{
+            Path = $files[0].FullName
+            Name = $files[0].Name
+            Temp = $null
+            Size = [long]$files[0].Length
+        }
+    }
+    $stage = Join-Path $env:TEMP ("{0}-stage-{1}" -f $script:CommandName, [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Force -Path $stage | Out-Null
+    foreach ($dir in $dirs) {
+        Copy-Item -LiteralPath $dir.FullName -Destination (Join-Path $stage $dir.Name) -Recurse -Force
+    }
+    foreach ($file in $files) {
+        $dest = Join-Path $stage $file.Name
+        $n = 1
+        while (Test-Path -LiteralPath $dest) {
+            $dest = Join-Path $stage ("{0} ({1}){2}" -f $file.BaseName, $n, $file.Extension)
+            $n++
+        }
+        Copy-Item -LiteralPath $file.FullName -Destination $dest -Force
+    }
+    $zip = Join-Path $env:TEMP ("{0}-{1}.zip" -f $script:AppName, [guid]::NewGuid().ToString('N'))
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    [IO.Compression.ZipFile]::CreateFromDirectory($stage, $zip)
+    Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+    return @{
+        Path = $zip
+        Name = "$($script:AppName).zip"
+        Temp = $zip
+        Size = [long](Get-Item -LiteralPath $zip).Length
+    }
+}
+
+function Read-HttpHeaders {
+    param($Stream)
+    $ms = New-Object System.IO.MemoryStream
+    $one = New-Object byte[] 1
+    while ($ms.Length -lt 16384) {
+        $n = $Stream.Read($one, 0, 1)
+        if ($n -le 0) { break }
+        $ms.Write($one, 0, 1)
+        if ($ms.Length -ge 4) {
+            $buffer = $ms.GetBuffer()
+            $i = [int]$ms.Length - 4
+            if ($buffer[$i] -eq 13 -and $buffer[$i + 1] -eq 10 -and $buffer[$i + 2] -eq 13 -and $buffer[$i + 3] -eq 10) { break }
+        }
+    }
+    return [Text.Encoding]::ASCII.GetString($ms.ToArray(), 0, [int]$ms.Length)
+}
+
+function Write-HttpBytes {
+    param($Stream, [string]$Head, [byte[]]$Body)
+    $headBytes = [Text.Encoding]::ASCII.GetBytes($Head)
+    $Stream.Write($headBytes, 0, $headBytes.Length)
+    if ($Body -and $Body.Length -gt 0) {
+        $Stream.Write($Body, 0, $Body.Length)
+    }
+}
+
+function Send-HttpText {
+    param($Stream, [int]$Code, [string]$Status, [string]$ContentType, [string]$Body)
+    $bytes = [Text.Encoding]::UTF8.GetBytes($Body)
+    $head = "HTTP/1.1 $Code $Status`r`nContent-Type: $ContentType; charset=utf-8`r`nContent-Length: $($bytes.Length)`r`nConnection: close`r`n`r`n"
+    Write-HttpBytes -Stream $Stream -Head $head -Body $bytes
+}
+
+function Send-FileResponse {
+    param($Stream, [string]$FilePath, [string]$DownloadName)
+    $len = [long](Get-Item -LiteralPath $FilePath).Length
+    $ascii = ($DownloadName -replace '[^\x20-\x7E]', '_') -replace '"', ''
+    $star = [Uri]::EscapeDataString($DownloadName)
+    $head = "HTTP/1.1 200 OK`r`nContent-Type: application/octet-stream`r`nContent-Length: $len`r`nContent-Disposition: attachment; filename=`"$ascii`"; filename*=UTF-8''$star`r`nConnection: close`r`n`r`n"
+    $headBytes = [Text.Encoding]::ASCII.GetBytes($head)
+    $Stream.Write($headBytes, 0, $headBytes.Length)
+    $fs = [IO.File]::Open($FilePath, 'Open', 'Read', 'ReadWrite')
+    try {
+        $buf = New-Object byte[] (1MB)
+        while (($n = $fs.Read($buf, 0, $buf.Length)) -gt 0) {
+            $Stream.Write($buf, 0, $n)
+        }
+        $Stream.Flush()
+    } finally {
+        $fs.Dispose()
+    }
+}
+
+function Test-PinMatch {
+    param([string]$Given, [string]$Expected)
+    if ([string]::IsNullOrEmpty($Given) -or [string]::IsNullOrEmpty($Expected)) { return $false }
+    if ($Given.Length -ne $Expected.Length) { return $false }
+    $diff = 0
+    for ($i = 0; $i -lt $Given.Length; $i++) {
+        $diff = $diff -bor ([int][char]$Given[$i] -bxor [int][char]$Expected[$i])
+    }
+    return ($diff -eq 0)
+}
+
+function Handle-HttpClient {
+    param($Client, [string]$Token, [string]$Pin, [string]$FilePath, [string]$DownloadName)
+    $Client.ReceiveTimeout = 20000
+    $stream = $Client.GetStream()
+    $raw = Read-HttpHeaders $stream
+    $line = ($raw -split "`r`n")[0]
+    if ($line -notmatch '^GET\s+(\S+)\s+HTTP/') {
+        Send-HttpText $stream 400 'Bad Request' 'text/plain' 'Bad request'
+        return $false
+    }
+    $target = $Matches[1]
+    $q = $target.IndexOf('?')
+    $path = if ($q -ge 0) { $target.Substring(0, $q) } else { $target }
+    $query = if ($q -ge 0) { $target.Substring($q + 1) } else { '' }
+    $given = $null
+    foreach ($pair in ($query -split '&')) {
+        if (-not $pair) { continue }
+        $kv = $pair -split '=', 2
+        if ($kv[0] -eq 'pin' -and $kv.Length -eq 2) {
+            $given = [Uri]::UnescapeDataString(($kv[1] -replace '\+', ' '))
+        }
+    }
+    $downloadPath = "/d/$Token"
+    if ($path -eq '/' -or ($path -eq $downloadPath -and -not $given)) {
+        $html = @"
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>$($script:AppName)</title></head>
+<body>
+<p>Enter the PIN from the other PC.</p>
+<form method="get" action="$downloadPath">
+<input name="pin" inputmode="numeric" autofocus>
+<button type="submit">Download</button>
+</form>
+</body></html>
+"@
+        Send-HttpText $stream 200 'OK' 'text/html' $html
+        return $false
+    }
+    if ($path -ne $downloadPath) {
+        Send-HttpText $stream 404 'Not Found' 'text/plain' 'Not found'
+        return $false
+    }
+    if (-not (Test-PinMatch $given $Pin)) {
+        Send-HttpText $stream 401 'Unauthorized' 'text/plain' 'Wrong PIN'
+        return $false
+    }
+    Send-FileResponse $stream $FilePath $DownloadName
+    return $true
+}
+
+function Send-Beacon {
+    param($Udp, [string]$Token, [int]$Port, [long]$Size, [string]$FileName)
+    $msg = @(
+        $script:BeaconPrefix,
+        $Token,
+        $Port,
+        (ConvertTo-BeaconField (Get-DisplayName)),
+        (ConvertTo-BeaconField $env:COMPUTERNAME),
+        $Size,
+        (ConvertTo-BeaconField $FileName)
+    ) -join '|'
+    $bytes = [Text.Encoding]::UTF8.GetBytes($msg)
+    [void]$Udp.Send($bytes, $bytes.Length, '255.255.255.255', $script:BeaconPort)
+}
+
+function Start-ShareServer {
+    param(
+        [string]$FilePath,
+        [string]$DownloadName,
+        [string]$TempToDelete,
+        [string]$ReadyFile,
+        [switch]$Quiet
+    )
+    $listener = $null
+    $port = 0
+    foreach ($candidate in $script:PortFirst..$script:PortLast) {
+        $tryListen = $null
+        try {
+            $tryListen = New-Object System.Net.Sockets.TcpListener ([Net.IPAddress]::Any, $candidate)
+            $tryListen.Start()
+            $listener = $tryListen
+            $port = $candidate
+            break
+        } catch {
+            if ($tryListen) { try { $tryListen.Stop() } catch {} }
+        }
+    }
+    if (-not $listener) { throw "No free port between $($script:PortFirst) and $($script:PortLast)." }
+
+    $token = ([guid]::NewGuid().ToString('N')).Substring(0, 16)
+    $pin = (Get-Random -Minimum 0 -Maximum 1000000).ToString('000000')
+    $size = [long](Get-Item -LiteralPath $FilePath).Length
+    $udp = New-Object System.Net.Sockets.UdpClient
+    $udp.EnableBroadcast = $true
+    $done = $false
+    try {
+        if ($ReadyFile) {
+            Set-Content -LiteralPath $ReadyFile -Value "$port $pin $token" -Encoding ASCII
+        }
+        if ($Quiet) {
+            [Console]::Out.WriteLine("READY $port $pin $token")
+            [Console]::Out.Flush()
+        } else {
+            Write-Host ''
+            Write-Host ("Other PCs see you as: {0} ({1})" -f (Get-DisplayName), $env:COMPUTERNAME)
+            Write-Host ("File: {0}  ({1})" -f $DownloadName, (Format-ByteSize $size))
+            Write-Host ''
+            Write-Host "PIN  $pin" -ForegroundColor Yellow
+            $shown = @(Get-LanIPv4)
+            if ($shown.Count -eq 0) { $shown = @('127.0.0.1') }
+            foreach ($ip in $shown) {
+                Write-Host "URL  http://${ip}:$port/" -ForegroundColor Yellow
+            }
+            Write-Host ''
+            Write-Host 'Leave this window open. Waiting up to 15 minutes for one download.'
+            Write-Host 'Press Q to cancel.' -ForegroundColor DarkGray
+        }
+        $deadline = (Get-Date).AddMinutes(15)
+        $lastBeacon = [datetime]::MinValue
+        while (-not $done -and (Get-Date) -lt $deadline) {
+            if (((Get-Date) - $lastBeacon).TotalSeconds -ge 1) {
+                try { Send-Beacon $udp $token $port $size $DownloadName } catch {}
+                $lastBeacon = Get-Date
+            }
+            if (-not $Quiet) {
+                try {
+                    if (-not [Console]::IsInputRedirected -and [Console]::KeyAvailable) {
+                        $key = [Console]::ReadKey($true)
+                        if ($key.Key -eq 'Q' -or $key.Key -eq 'Escape') { break }
+                    }
+                } catch {}
+            }
+            if (-not $listener.Pending()) {
+                Start-Sleep -Milliseconds 200
+                continue
+            }
+            $client = $listener.AcceptTcpClient()
+            try {
+                $ok = Handle-HttpClient $client $token $pin $FilePath $DownloadName
+                if ($ok) { $done = $true }
+            } catch {
+            } finally {
+                try { $client.Close() } catch {}
+            }
+        }
+        if (-not $Quiet) {
+            Write-Host ''
+            if ($done) { Write-Host 'Download finished. You can close this window.' -ForegroundColor Green }
+            else { Write-Host 'Stopped before a download finished.' -ForegroundColor Yellow }
+        }
+    } finally {
+        try { $listener.Stop() } catch {}
+        try { $udp.Close() } catch {}
+        if ($TempToDelete) {
+            Remove-Item -LiteralPath $TempToDelete -Force -ErrorAction SilentlyContinue
+        }
+    }
+    return $done
+}
+
+function Show-SendFiles {
+    while ($true) {
+        $items = @(Get-OutboxItems)
+        Clear-Host
+        Write-Host 'Send files' -ForegroundColor Cyan
+        Write-Host ''
+        Write-Host (Get-SendStepsText)
+        Write-Host ''
+        if ($items.Count -eq 0) {
+            Write-Host 'The Outbox is empty.' -ForegroundColor Yellow
+            Write-Host ("Put files in {0}" -f (Get-OutboxPath))
+            Write-Host ''
+            $open = Read-Host '[O] Open Outbox  [Q] Back'
+            if ($open -match '^[Oo]') { Open-Folder (Get-OutboxPath) }
+            return
+        }
+        $selected = @{}
+        for ($i = 0; $i -lt $items.Count; $i++) { $selected[$i] = $true }
+        $confirmed = $false
+        $picked = @()
+        while (-not $confirmed) {
+            Clear-Host
+            Write-Host 'Send files' -ForegroundColor Cyan
+            Write-Host ''
+            Write-Host (Get-SendStepsText)
+            Write-Host ''
+            Write-Host ("  {0,-4} {1,-6} {2,-42} {3}" -f '#', 'Send', 'Name', 'Size')
+            for ($i = 0; $i -lt $items.Count; $i++) {
+                $mark = if ($selected[$i]) { '[x]' } else { '[ ]' }
+                Write-Host ("  {0,-4} {1,-6} {2,-42} {3}" -f ($i + 1), $mark, (Get-ShortText $items[$i].Name), (Format-ByteSize (Get-TreeSize $items[$i])))
+            }
+            Write-Host ''
+            Write-Host 'Number toggles a file. A all, N none, O open folder, C continue, Q back.'
+            $choice = Read-Host 'Choice'
+            if ($choice -match '^[Qq]$') { return }
+            if ($choice -match '^[Aa]$') {
+                for ($i = 0; $i -lt $items.Count; $i++) { $selected[$i] = $true }
+                continue
+            }
+            if ($choice -match '^[Nn]$') {
+                for ($i = 0; $i -lt $items.Count; $i++) { $selected[$i] = $false }
+                continue
+            }
+            if ($choice -match '^[Oo]$') { Open-Folder (Get-OutboxPath); continue }
+            if ($choice -match '^\d+$') {
+                $idx = [int]$choice - 1
+                if ($idx -ge 0 -and $idx -lt $items.Count) { $selected[$idx] = -not $selected[$idx] }
+                continue
+            }
+            if ($choice -match '^[Cc]$') {
+                $picked = @()
+                for ($i = 0; $i -lt $items.Count; $i++) {
+                    if ($selected[$i]) { $picked += $items[$i] }
+                }
+                if ($picked.Count -eq 0) {
+                    Write-Host 'Select at least one file.' -ForegroundColor Yellow
+                    Start-Sleep -Seconds 1
+                    continue
+                }
+                $total = 0L
+                foreach ($item in $picked) { $total += Get-TreeSize $item }
+                Clear-Host
+                Write-Host 'Confirm send' -ForegroundColor Cyan
+                Write-Host ''
+                foreach ($item in $picked) {
+                    Write-Host ("  {0}  ({1})" -f $item.Name, (Format-ByteSize (Get-TreeSize $item)))
+                }
+                Write-Host ''
+                Write-Host ("{0} item(s), {1}" -f $picked.Count, (Format-ByteSize $total))
+                $folders = @($picked | Where-Object { $_.PSIsContainer })
+                if ($picked.Count -gt 1 -or $folders.Count -gt 0) {
+                    Write-Host 'These will be sent as one zip.'
+                }
+                $yes = Read-Host 'Send these? [Y/N]'
+                if ($yes -match '^[Yy]') { $confirmed = $true }
+            }
+        }
+        Write-Host ''
+        Write-Host 'Preparing the transfer...' -ForegroundColor DarkGray
+        $payload = $null
+        try {
+            $payload = New-SendPayload $picked
+            [void](Start-ShareServer -FilePath $payload.Path -DownloadName $payload.Name -TempToDelete $payload.Temp)
+        } catch {
+            Write-Host $_.Exception.Message -ForegroundColor Red
+            if ($payload -and $payload.Temp) {
+                Remove-Item -LiteralPath $payload.Temp -Force -ErrorAction SilentlyContinue
+            }
+        }
+        Wait-Enter
+        return
+    }
+}
+
+function Receive-Beacons {
+    param([int]$Seconds = 4)
+    $udp = New-Object System.Net.Sockets.UdpClient
+    $found = @{}
+    try {
+        $udp.Client.SetSocketOption([Net.Sockets.SocketOptionLevel]::Socket, [Net.Sockets.SocketOptionName]::ReuseAddress, $true)
+        $udp.Client.Bind((New-Object System.Net.IPEndPoint ([Net.IPAddress]::Any, $script:BeaconPort)))
+        $udp.Client.ReceiveTimeout = 400
+        $end = (Get-Date).AddSeconds($Seconds)
+        while ((Get-Date) -lt $end) {
+            try {
+                $remote = New-Object System.Net.IPEndPoint ([Net.IPAddress]::Any, 0)
+                $bytes = $udp.Receive([ref]$remote)
+                $msg = [Text.Encoding]::UTF8.GetString($bytes)
+                $parts = $msg.Split('|')
+                if ($parts.Length -lt 7) { continue }
+                if ($parts[0] -ne $script:BeaconPrefix) { continue }
+                $key = '{0}:{1}:{2}' -f $remote.Address.ToString(), $parts[2], $parts[1]
+                $found[$key] = @{
+                    IP = $remote.Address.ToString()
+                    Token = $parts[1]
+                    Port = [int]$parts[2]
+                    Display = $parts[3]
+                    Windows = $parts[4]
+                    Size = [long]$parts[5]
+                    File = ($parts[6..($parts.Length - 1)] -join '|')
+                }
+            } catch {}
+        }
+    } catch {
+        Write-Host "Could not listen for other PCs. $($_.Exception.Message)" -ForegroundColor Yellow
+        return @()
+    } finally {
+        try { $udp.Close() } catch {}
+    }
+    return @($found.Values)
+}
+
+function Test-TcpOpen {
+    param([string]$Address, [int]$Port, [int]$TimeoutMs = 800)
+    $client = New-Object System.Net.Sockets.TcpClient
+    try {
+        $iar = $client.BeginConnect($Address, $Port, $null, $null)
+        if (-not $iar.AsyncWaitHandle.WaitOne($TimeoutMs, $false)) { return $false }
+        $client.EndConnect($iar)
+        return [bool]$client.Connected
+    } catch {
+        return $false
+    } finally {
+        try { $client.Close() } catch {}
+    }
+}
+
+function Test-Icmp {
+    param([string]$Address)
+    try {
+        return [bool](Test-Connection -ComputerName $Address -Count 1 -Quiet -ErrorAction Stop)
+    } catch {
+        return $false
+    }
+}
+
+function Format-Check {
+    param([bool]$Ok)
+    if ($Ok) { return 'ok' }
+    return 'no'
+}
+
+function Show-CheckConnection {
+    Clear-Host
+    Write-Host 'Check connection' -ForegroundColor Cyan
+    Write-Host ''
+    Write-Host ("This PC: {0} ({1})" -f (Get-DisplayName), $env:COMPUTERNAME)
+    $mine = @(Get-LanIPv4)
+    if ($mine.Count -eq 0) { Write-Host 'LAN address: none' }
+    else { Write-Host ("LAN address: " + ($mine -join ', ')) }
+    Write-Host ''
+    Write-Host 'Looking for other PCs...'
+    $shares = @(Receive-Beacons -Seconds 4)
+    if ($shares.Count -eq 0) {
+        Write-Host 'No other PC answered.' -ForegroundColor Yellow
+    }
+    foreach ($share in $shares) {
+        $ping = Test-Icmp $share.IP
+        $tcp = Test-TcpOpen $share.IP $share.Port
+        Write-Host ''
+        Write-Host ("{0} ({1})" -f $share.Display, $share.Windows) -ForegroundColor Cyan
+        Write-Host ("  {0}:{1}  ping {2}  transfer port {3}  {4}" -f $share.IP, $share.Port, (Format-Check $ping), (Format-Check $tcp), $share.File)
+    }
+    Write-Host ''
+    Write-Host 'Ping can fail on Windows even when a transfer would work. The transfer port is the result that matters.'
+    $ip = Read-Host 'Type an IP to check, or press Enter to go back'
+    if ($ip) {
+        $ip = $ip.Trim()
+        $ping = Test-Icmp $ip
+        $open = $null
+        foreach ($candidate in $script:PortFirst..$script:PortLast) {
+            if (Test-TcpOpen $ip $candidate) { $open = $candidate; break }
+        }
+        Write-Host ''
+        Write-Host ("{0}  ping {1}" -f $ip, (Format-Check $ping))
+        if ($open) { Write-Host "Transfer port ${open}: ok" -ForegroundColor Green }
+        else { Write-Host 'Transfer port: not open. That PC may not be sending right now.' -ForegroundColor Yellow }
+        Wait-Enter
+    }
+}
+
+function Get-UniqueFilePath {
+    param([string]$Directory, [string]$Name)
+    $leaf = [IO.Path]::GetFileName($Name)
+    if (-not $leaf) { $leaf = "$($script:AppName)-download" }
+    $dest = Join-Path $Directory $leaf
+    $base = [IO.Path]::GetFileNameWithoutExtension($leaf)
+    $ext = [IO.Path]::GetExtension($leaf)
+    $i = 1
+    while (Test-Path -LiteralPath $dest) {
+        $dest = Join-Path $Directory ("{0} ({1}){2}" -f $base, $i, $ext)
+        $i++
+    }
+    return $dest
+}
+
+function Save-RemoteFile {
+    param([string]$Url, [string]$Directory)
+    Add-Type -AssemblyName System.Net.Http
+    if (-not (Test-Path -LiteralPath $Directory)) {
+        New-Item -ItemType Directory -Force -Path $Directory | Out-Null
+    }
+    $client = New-Object System.Net.Http.HttpClient
+    $client.Timeout = [TimeSpan]::FromHours(6)
+    try {
+        $resp = $client.GetAsync($Url, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
+        if (-not $resp.IsSuccessStatusCode) {
+            $errText = ''
+            try { $errText = $resp.Content.ReadAsStringAsync().GetAwaiter().GetResult() } catch {}
+            throw "Download failed ($([int]$resp.StatusCode)). $errText"
+        }
+        $total = $resp.Content.Headers.ContentLength
+        $disposition = $resp.Content.Headers.ContentDisposition
+        $name = $null
+        if ($disposition) {
+            if ($disposition.FileNameStar) { $name = $disposition.FileNameStar.Trim('"') }
+            elseif ($disposition.FileName) { $name = $disposition.FileName.Trim('"') }
+        }
+        if (-not $name) { $name = "$($script:AppName)-download" }
+        $dest = Get-UniqueFilePath $Directory $name
+        $inputStream = $resp.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+        $output = [IO.File]::Create($dest)
+        try {
+            $buf = New-Object byte[] (1MB)
+            $readTotal = 0L
+            while (($n = $inputStream.Read($buf, 0, $buf.Length)) -gt 0) {
+                $output.Write($buf, 0, $n)
+                $readTotal += $n
+                if ($total -and $total -gt 0) {
+                    $pct = [int](($readTotal * 100) / $total)
+                    if ($pct -gt 100) { $pct = 100 }
+                    Write-Progress -Activity 'Receiving' -Status $name -PercentComplete $pct
+                }
+            }
+        } finally {
+            $output.Dispose()
+            $inputStream.Dispose()
+            Write-Progress -Activity 'Receiving' -Completed
+        }
+        return $dest
+    } finally {
+        $client.Dispose()
+    }
+}
+
+function Show-ReceiveFiles {
+    Clear-Host
+    Write-Host 'Receive files' -ForegroundColor Cyan
+    Write-Host ''
+    Write-Host (Get-ReceiveStepsText)
+    Write-Host ''
+    Write-Host 'Looking for a PC that is sending...'
+    $shares = @(Receive-Beacons -Seconds 5)
+    if ($shares.Count -eq 0) {
+        Write-Host 'Nobody is sending right now. Start Send on the other PC, then try again.' -ForegroundColor Yellow
+        Wait-Enter
+        return
+    }
+    $chosen = $null
+    if ($shares.Count -eq 1) {
+        $chosen = $shares[0]
+    } else {
+        for ($i = 0; $i -lt $shares.Count; $i++) {
+            $share = $shares[$i]
+            Write-Host ("  [{0}] {1} ({2})  {3}  {4}" -f ($i + 1), $share.Display, $share.Windows, $share.File, (Format-ByteSize $share.Size))
+        }
+        $pick = Read-Host 'Number'
+        if ($pick -notmatch '^\d+$') { return }
+        $idx = [int]$pick - 1
+        if ($idx -lt 0 -or $idx -ge $shares.Count) { return }
+        $chosen = $shares[$idx]
+    }
+    $ping = Test-Icmp $chosen.IP
+    $tcp = Test-TcpOpen $chosen.IP $chosen.Port
+    Write-Host ''
+    Write-Host ("{0} ({1})" -f $chosen.Display, $chosen.Windows)
+    Write-Host ("{0}  ({1})" -f $chosen.File, (Format-ByteSize $chosen.Size))
+    Write-Host ("ping {0}   transfer port {1}" -f (Format-Check $ping), (Format-Check $tcp))
+    if (-not $tcp) {
+        Write-Host 'The transfer port is not open from here.' -ForegroundColor Yellow
+    }
+    $tries = 0
+    while ($tries -lt 3) {
+        $pin = Read-Host 'PIN'
+        if (-not $pin) { return }
+        $pin = $pin.Trim()
+        $url = "http://$($chosen.IP):$($chosen.Port)/d/$($chosen.Token)?pin=$([Uri]::EscapeDataString($pin))"
+        try {
+            $saved = Save-RemoteFile -Url $url -Directory (Get-InboxPath)
+            Write-Host ''
+            Write-Host "Saved to $saved" -ForegroundColor Green
+            Wait-Enter
+            return
+        } catch {
+            $tries++
+            Write-Host $_.Exception.Message -ForegroundColor Red
+            if ($tries -ge 3) { Wait-Enter; return }
+        }
+    }
+}
+
+function Show-SlipMenu {
+    param([switch]$CanReturn)
+    while ($true) {
+        Clear-Host
+        $ips = @(Get-LanIPv4)
+        $ipText = if ($ips.Count -gt 0) { $ips[0] } else { 'no LAN address' }
+        $outCount = @(Get-OutboxItems).Count
+        $ready = (Test-SlipInstalled) -and (Test-FirewallRule $script:RuleTcp) -and (Test-FirewallRule $script:RuleUdp)
+        Write-Host $script:AppName -ForegroundColor Cyan
+        Write-Host "Windows name: $env:COMPUTERNAME"
+        Write-Host ("Shown as: {0}    {1}" -f (Get-DisplayName), $ipText)
+        if ($ready) { Write-Host "Setup: ready   Outbox: $outCount files" -ForegroundColor Green }
+        else { Write-Host "Setup: not ready   Outbox: $outCount files" -ForegroundColor Yellow }
+        Write-Host ''
+        Write-Host '  1  How to send and receive'
+        Write-Host '  2  Status'
+        Write-Host '  3  Repair'
+        Write-Host '  4  Remove'
+        Write-Host '  5  Rename this PC'
+        Write-Host '  6  Check connection'
+        Write-Host '  7  Send files'
+        Write-Host '  8  Receive files'
+        Write-Host '  9  Open Outbox folder'
+        if ($CanReturn) { Write-Host '  0  Back' } else { Write-Host '  0  Quit' }
+        Write-Host ''
+        $choice = Read-Host 'Choice'
+        if ($choice -eq '' -and [Console]::IsInputRedirected) { return }
+        switch ($choice) {
+            '1' { Show-HowTo }
+            '2' { Show-Status }
+            '3' { Show-RepairScreen }
+            '4' { Invoke-RemoveSlip }
+            '5' { Rename-ThisPc }
+            '6' { Show-CheckConnection }
+            '7' { Show-SendFiles }
+            '8' { Show-ReceiveFiles }
+            '9' { Open-Folder (Get-OutboxPath) }
+            '0' { return }
+        }
+    }
+}
+
+function Uninstall-PreviousOctane {
+    $names = @('Runscope', 'Octane')
+    $roots = @(
+        'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
+        'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
+        'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+    )
+    foreach ($root in $roots) {
+        if (-not (Test-Path $root)) { continue }
+        try { $keys = @(Get-ChildItem $root -ErrorAction Stop) } catch { continue }
+        foreach ($key in $keys) {
+            try { $prop = Get-ItemProperty $key.PSPath -ErrorAction Stop } catch { continue }
+            if (-not $prop.DisplayName) { continue }
+            if ($names -notcontains $prop.DisplayName) { continue }
+            $cmd = $prop.QuietUninstallString
+            if (-not $cmd) { $cmd = $prop.UninstallString }
+            if (-not $cmd) { continue }
+            Write-Host "Removing $($prop.DisplayName)..."
+            if ($cmd -notmatch '(?i)(^|\s)/S(\s|$)') { $cmd = "$cmd /S" }
+            try {
+                cmd /c $cmd | Out-Null
+                Start-Sleep -Seconds 3
+            } catch {
+                Write-Host "Could not remove $($prop.DisplayName)." -ForegroundColor Yellow
+            }
+        }
+    }
+}
+
+function Install-LatestOctane {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $repo = 'Everlasting-dev/octane'
+    $dir = Join-Path $env:TEMP 'octane-setup'
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $setupPath = Join-Path $dir 'Octane-Setup.exe'
+    $previous = $ProgressPreference
+    $ProgressPreference = 'SilentlyContinue'
+    try {
+        $release = Invoke-RestMethod -Headers @{ 'User-Agent' = 'octane-download' } -Uri "https://api.github.com/repos/$repo/releases/latest"
+        $setup = $release.assets | Where-Object { $_.name -like 'Octane-Setup-*.exe' } | Select-Object -First 1
+        if (-not $setup) { throw 'No Octane installer is attached to the latest release.' }
+        Write-Host "Downloading $($setup.name)..."
+        Invoke-WebRequest -Headers @{ 'User-Agent' = 'octane-download' } -Uri $setup.browser_download_url -OutFile $setupPath
+        Write-Host 'Installing Octane...'
+        $proc = Start-Process -FilePath $setupPath -ArgumentList '/S' -Wait -PassThru
+        if ($proc.ExitCode -ne 0) { throw "Installer exited with code $($proc.ExitCode)." }
+        Write-Host 'Octane installed.' -ForegroundColor Green
+    } finally {
+        $ProgressPreference = $previous
+        if (Test-Path -LiteralPath $dir) {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Invoke-GetOctane {
+    Clear-Host
+    Write-Host 'Get Octane' -ForegroundColor Cyan
+    Write-Host ''
+    Write-Host 'This downloads the latest Octane-Setup from'
+    Write-Host 'Everlasting-dev/octane and installs it for this Windows user.'
+    Write-Host 'No administrator prompt.'
+    Write-Host ''
+    Write-Host 'If Octane or Runscope is already installed, that copy is'
+    Write-Host 'removed first and the latest release is installed.'
+    Write-Host 'Your logs are not deleted.' -ForegroundColor Green
+    Write-Host ''
+    Write-Host 'The setup file is removed from Temp when it finishes.'
+    Write-Host ''
+    $answer = Read-Host '[Y] Install  [N] Back'
+    if ($answer -notmatch '^[Yy]') { return }
+    Write-Host ''
+    try {
+        Uninstall-PreviousOctane
+        Install-LatestOctane
+    } catch {
+        Write-Host $_.Exception.Message -ForegroundColor Red
+    }
+    Wait-Enter
+}
+
+function Show-Launcher {
+    while ($true) {
+        Clear-Host
+        Write-Host 'everlasting-dev' -ForegroundColor Cyan
+        Write-Host "This PC: $env:COMPUTERNAME"
+        if (Test-SlipInstalled) { Write-Host "$($script:AppName): installed" -ForegroundColor Green }
+        else { Write-Host "$($script:AppName): not installed" -ForegroundColor Yellow }
+        Write-Host ''
+        Write-Host '  [1] Get Octane'
+        Write-Host "  [2] Get $($script:AppName)"
+        Write-Host '  [3] Quit'
+        Write-Host ''
+        $choice = Read-Host 'Choice'
+        if ($choice -eq '' -and [Console]::IsInputRedirected) { return }
+        switch ($choice) {
+            '1' { Invoke-GetOctane }
+            '2' { Invoke-GetSlipFromLauncher }
+            '3' { return }
+        }
+    }
+}
+
+function Get-EntryOptions {
+    $o = @{
+        Entry = 'launcher'
+        Address = $null
+        Port = 0
+        Pin = $null
+        Token = $null
+        OutDir = $null
+        ReadyFile = $null
+        Paths = @()
+    }
+    if ($env:SLIP_ENTRY) { $o.Entry = $env:SLIP_ENTRY }
+    $pending = @($script:RawArgs)
+    $paths = @()
+    $i = 0
+    while ($i -lt $pending.Count) {
+        $token = [string]$pending[$i]
+        if ($token -eq 'menu') { $o.Entry = 'menu' }
+        elseif ($token -eq 'firewall') { $o.Entry = 'firewall' }
+        elseif ($token -eq 'unfirewall') { $o.Entry = 'unfirewall' }
+        elseif ($token -eq 'serve') { $o.Entry = 'serve' }
+        elseif ($token -eq 'recv') { $o.Entry = 'recv' }
+        elseif ($token -eq '-Address' -and ($i + 1) -lt $pending.Count) { $i++; $o.Address = [string]$pending[$i] }
+        elseif ($token -eq '-Port' -and ($i + 1) -lt $pending.Count) { $i++; $o.Port = [int]$pending[$i] }
+        elseif ($token -eq '-Pin' -and ($i + 1) -lt $pending.Count) { $i++; $o.Pin = [string]$pending[$i] }
+        elseif ($token -eq '-Token' -and ($i + 1) -lt $pending.Count) { $i++; $o.Token = [string]$pending[$i] }
+        elseif ($token -eq '-OutDir' -and ($i + 1) -lt $pending.Count) { $i++; $o.OutDir = [string]$pending[$i] }
+        elseif ($token -eq '-ReadyFile' -and ($i + 1) -lt $pending.Count) { $i++; $o.ReadyFile = [string]$pending[$i] }
+        elseif ($token -like '-*') { }
+        else { $paths += $token }
+        $i++
+    }
+    $o.Paths = $paths
+    return $o
+}
+
+function Exit-Slip {
+    param([int]$Code)
+    if ($PSCommandPath) { exit $Code }
+}
+
+$script:Opt = Get-EntryOptions
+switch ($script:Opt.Entry) {
+    'firewall' {
+        try {
+            Install-FirewallRules
+            Exit-Slip 0
+        } catch {
+            Write-Host $_.Exception.Message -ForegroundColor Red
+            Exit-Slip 1
+        }
+    }
+    'unfirewall' {
+        try {
+            Uninstall-FirewallRules
+            Exit-Slip 0
+        } catch {
+            Write-Host $_.Exception.Message -ForegroundColor Red
+            Exit-Slip 1
+        }
+    }
+    'serve' {
+        if ($script:Opt.Paths.Count -lt 1) {
+            [Console]::Error.WriteLine('serve needs a file path')
+            Exit-Slip 1
+        } else {
+            $items = @(foreach ($path in $script:Opt.Paths) { Get-Item -LiteralPath $path })
+            $payload = New-SendPayload $items
+            $ok = Start-ShareServer -FilePath $payload.Path -DownloadName $payload.Name -TempToDelete $payload.Temp -ReadyFile $script:Opt.ReadyFile -Quiet
+            if ($ok) { Exit-Slip 0 } else { Exit-Slip 2 }
+        }
+    }
+    'recv' {
+        if (-not $script:Opt.Address -or -not $script:Opt.Port -or -not $script:Opt.Pin -or -not $script:Opt.Token) {
+            [Console]::Error.WriteLine('recv needs -Address -Port -Pin -Token')
+            Exit-Slip 1
+        } else {
+            $destDir = if ($script:Opt.OutDir) { $script:Opt.OutDir } else { Get-InboxPath }
+            $url = "http://$($script:Opt.Address):$($script:Opt.Port)/d/$($script:Opt.Token)?pin=$([Uri]::EscapeDataString($script:Opt.Pin))"
+            try {
+                $saved = Save-RemoteFile -Url $url -Directory $destDir
+                [Console]::Out.WriteLine($saved)
+                Exit-Slip 0
+            } catch {
+                [Console]::Error.WriteLine($_.Exception.Message)
+                Exit-Slip 1
+            }
+        }
+    }
+    'menu' { Show-SlipMenu }
+    default { Show-Launcher }
 }
