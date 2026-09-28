@@ -3,6 +3,13 @@
 Internal handoff log for Cursor agents and plugins. Newest entries first.
 Read before editing; append after substantive changes.
 
+## 2026-09-28 — slip command, arrows, and quick send
+
+- **Why:** the published `get` script should match the local Slip command, presence beacon, and optional quick receive
+- **Changes:** replaced `get` with the script that installs `slip` on PATH, beacons while the menu is open, uses arrow keys, and can accept a send with no PIN when Quick receive is on
+- **Files:** `get`, `AGENT_CHANGELOG.md`
+- **Notes:** Quick receive stays off until the user turns it on. Repair still must not delete Outbox or Inbox files.
+
 ## 2026-09-28 — shorter Slip menu and percent line
 
 - **Why:** the published `get` script should match the local launcher
