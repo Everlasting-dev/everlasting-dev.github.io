@@ -3,6 +3,13 @@
 Internal handoff log for Cursor agents and plugins. Newest entries first.
 Read before editing; append after substantive changes.
 
+## 2026-09-28 — cmd menus and quick send to a chosen PC
+
+- **Why:** the published `get` script should match the Command Prompt menu fix and the Quick receive port fix
+- **Changes:** replaced `get` with the script that shows numbered rows in cmd, asks which PC to send to, and listens for Quick receive on ports 8787-8796
+- **Files:** `get`, `AGENT_CHANGELOG.md`
+- **Notes:** Quick receive stays off until the user turns it on. An already-running listener must be turned off and on so it picks up the allowed port.
+
 ## 2026-09-28 — slip command, arrows, and quick send
 
 - **Why:** the published `get` script should match the local Slip command, presence beacon, and optional quick receive

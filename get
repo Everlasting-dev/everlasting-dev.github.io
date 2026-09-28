@@ -216,9 +216,9 @@ del /f /q "%TEMP%\slip-get.ps1" >nul 2>&1
 "@
     $listenCmd = @"
 @echo off
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Invoke-RestMethod -Uri '$($script:SourceUrl)' -OutFile '%TEMP%\slip-get.ps1'"
-powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "%TEMP%\slip-get.ps1" listen
-del /f /q "%TEMP%\slip-get.ps1" >nul 2>&1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Invoke-RestMethod -Uri '$($script:SourceUrl)' -OutFile '%TEMP%\slip-listen.ps1'"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "%TEMP%\slip-listen.ps1" listen
+del /f /q "%TEMP%\slip-listen.ps1" >nul 2>&1
 "@
     Set-Content -LiteralPath (Join-Path $dir "$($script:CommandName).cmd") -Value $menuCmd -Encoding ASCII
     Set-Content -LiteralPath (Join-Path $dir "$($script:CommandName)-listen.cmd") -Value $listenCmd -Encoding ASCII
@@ -624,8 +624,10 @@ function Send-HttpText {
 }
 
 function Write-PercentLine {
-    param([string]$Label, [int]$Percent)
-    $text = '{0,-44} {1,3}%' -f $Label, $Percent
+    param([string]$Label, [int]$Percent, [long]$Size = -1)
+    $sizeText = ''
+    if ($Size -ge 0) { $sizeText = Format-ByteSize $Size }
+    $text = '{0,-32} {1,8} {2,3}%' -f $Label, $sizeText, $Percent
     Write-Host ("`r" + $text) -NoNewline
 }
 
@@ -649,7 +651,7 @@ function Send-FileResponse {
                 $pct = [int](($sent * 100) / $len)
                 if ($pct -gt 100) { $pct = 100 }
                 if ($pct -ne $last) {
-                    Write-PercentLine -Label ("Sending " + (Get-ShortText $DownloadName 32)) -Percent $pct
+                    Write-PercentLine -Label ("Sending " + (Get-ShortText $DownloadName 28)) -Percent $pct -Size $len
                     $last = $pct
                 }
             }
@@ -859,19 +861,20 @@ function Show-SendFiles {
             Write-Host ''
             Write-Host (Get-SendStepsText)
             Write-Host ''
-            Write-Host ("  {0,-4} {1,-6} {2,-42} {3}" -f '#', 'Send', 'Name', 'Size')
+            Write-Host ("  {0,-6} {1,-6} {2,-42} {3}" -f '#', 'Send', 'Name', 'Size')
             for ($i = 0; $i -lt $items.Count; $i++) {
                 $mark = if ($selected[$i]) { '[x]' } else { '[ ]' }
-                $line = "  {0,-4} {1,-6} {2,-42} {3}" -f ($i + 1), $mark, (Get-ShortText $items[$i].Name), (Format-ByteSize (Get-TreeSize $items[$i]))
-                if ($i -eq $cursor -and -not [Console]::IsInputRedirected) {
-                    Write-Host (">" + $line) -ForegroundColor Green
+                $line = "[{0}]  {1,-6} {2,-42} {3}" -f ($i + 1), $mark, (Get-ShortText $items[$i].Name), (Format-ByteSize (Get-TreeSize $items[$i]))
+                if ($i -eq $cursor -and (Test-SlipConsoleKeys)) {
+                    Write-Host ("  > " + $line) -ForegroundColor Green
                 }
                 else {
-                    Write-Host (" " + $line)
+                    Write-Host ("    " + $line)
                 }
             }
             Write-Host ''
-            Write-Host 'Arrows move. Space toggles. A number toggles that file. A all, N none, O open folder, C or Enter continue, Q back.'
+            Write-Host 'Arrow keys move. Space toggles. Type a number to toggle that file.'
+            Write-Host 'A all, N none, O open folder, C or Enter continue, Q back.'
             $choice = Read-PickerAction
             if ([string]::IsNullOrWhiteSpace($choice) -and [Console]::IsInputRedirected) { return }
             if ($choice -eq 'UP') {
@@ -934,17 +937,34 @@ function Show-SendFiles {
         }
         $usePin = $true
         $quickTarget = $null
+        $sendTotal = 0L
+        foreach ($item in $picked) { $sendTotal += Get-TreeSize $item }
         $mine = @(Get-LanIPv4)
         $quick = @()
+        Clear-Host
+        Write-Host 'Choose a PC' -ForegroundColor Cyan
+        Write-Host ''
+        Write-Host ("This send is {0}." -f (Format-ByteSize $sendTotal))
+        Write-Host 'Looking for PCs with Quick receive...'
         try {
             $quick = @(Receive-Beacons -Seconds 3 | Where-Object {
                 $_.Token -eq 'QUICK' -and $_.Port -gt 0 -and ($mine -notcontains $_.IP)
             })
         } catch { $quick = @() }
-        if ($quick.Count -gt 0) {
-            $labels = @($quick | ForEach-Object { "Send now to $($_.Display) (no PIN)" })
-            $labels += 'Send with a PIN'
-            $how = Read-ArrowMenu -Title 'How to send' -Items $labels -ZeroLabel 'Back'
+        if ($quick.Count -eq 0) {
+            Write-Host ''
+            Write-Host 'No other PC with Quick receive was found.' -ForegroundColor Yellow
+            Write-Host 'Open More on that PC and turn Quick receive on, then try again.'
+            $pinInstead = Read-Host 'Send with a PIN from this PC instead? [Y/N]'
+            if ($pinInstead -notmatch '^[Yy]') { return }
+        }
+        else {
+            $labels = @($quick | ForEach-Object { "{0} ({1})  {2}" -f $_.Display, $_.Windows, $_.IP })
+            $labels += 'Send with a PIN instead'
+            $how = Read-ArrowMenu -Title 'Choose a PC' -Lines @(
+                ("This send is {0}." -f (Format-ByteSize $sendTotal)),
+                'Pick the PC that should receive these files.'
+            ) -Items $labels -ZeroLabel 'Back' -Hint 'Arrow keys move. Enter chooses. Type the number to choose that PC. 0 goes back.'
             if ($how -lt 0) { return }
             if ($how -lt $quick.Count) {
                 $usePin = $false
@@ -958,7 +978,7 @@ function Show-SendFiles {
             $payload = New-SendPayload $picked
             if (-not $usePin) {
                 try {
-                    Invoke-QuickUpload -Address $quickTarget.IP -Port $quickTarget.Port -FilePath $payload.Path -DownloadName $payload.Name
+                    Invoke-QuickUpload -Address $quickTarget.IP -Port $quickTarget.Port -FilePath $payload.Path -DownloadName $payload.Name -TargetName $quickTarget.Display
                 } finally {
                     if ($payload.Temp) {
                         Remove-Item -LiteralPath $payload.Temp -Force -ErrorAction SilentlyContinue
@@ -1047,24 +1067,52 @@ function Format-Check {
     return 'no'
 }
 
+function Test-SlipConsoleKeys {
+    try {
+        if ([Console]::IsInputRedirected) { return $false }
+    } catch { return $false }
+    try {
+        if ($Host.Name -ne 'ConsoleHost') { return $false }
+        $null = $Host.UI.RawUI.KeyAvailable
+        return $true
+    } catch { return $false }
+}
+
+function Read-SlipKey {
+    $raw = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+    $code = [int]$raw.VirtualKeyCode
+    $char = ''
+    if ($raw.Character -and ([int][char]$raw.Character) -ge 32) { $char = [string]$raw.Character }
+    $name = ''
+    switch ($code) {
+        38 { $name = 'UpArrow' }
+        40 { $name = 'DownArrow' }
+        13 { $name = 'Enter' }
+        27 { $name = 'Escape' }
+        32 { $name = 'Spacebar' }
+        { $_ -ge 96 -and $_ -le 105 } { $char = [string]($_ - 96) }
+    }
+    return @{ Name = $name; Char = $char; Code = $code }
+}
+
 function Read-PickerAction {
-    if ([Console]::IsInputRedirected) { return (Read-Host 'Choice') }
-    $key = [Console]::ReadKey($true)
-    switch ($key.Key) {
+    if (-not (Test-SlipConsoleKeys)) { return (Read-Host 'Type a number') }
+    $key = Read-SlipKey
+    switch ($key.Name) {
         'UpArrow' { return 'UP' }
         'DownArrow' { return 'DOWN' }
         'Spacebar' { return 'TOGGLE' }
         'Enter' { return 'C' }
         'Escape' { return 'Q' }
     }
-    $chars = [string]$key.KeyChar
+    $chars = [string]$key.Char
     if ($chars -match '\d') {
         $watch = [Diagnostics.Stopwatch]::StartNew()
         while ($watch.ElapsedMilliseconds -lt 450) {
-            if ([Console]::KeyAvailable) {
-                $next = [Console]::ReadKey($true)
-                if ($next.KeyChar -match '\d') {
-                    $chars += $next.KeyChar
+            if ($Host.UI.RawUI.KeyAvailable) {
+                $next = Read-SlipKey
+                if ($next.Char -match '\d') {
+                    $chars += $next.Char
                     $watch.Restart()
                 }
                 else { break }
@@ -1082,9 +1130,10 @@ function Read-ArrowMenu {
         [string]$Title,
         [string[]]$Lines = @(),
         [string]$ZeroLabel = 'Back',
-        [string]$Hint = 'Arrows move. Enter chooses. A number chooses too. 0 goes back.'
+        [string]$Hint = 'Arrow keys move. Enter chooses. Type the number to choose that line. 0 goes back.'
     )
     $index = 0
+    $interactive = Test-SlipConsoleKeys
     while ($true) {
         Clear-Host
         if ($Title) {
@@ -1097,19 +1146,20 @@ function Read-ArrowMenu {
         }
         if ($Lines.Count -gt 0) { Write-Host '' }
         for ($i = 0; $i -lt $Items.Count; $i++) {
-            if ($i -eq $index -and -not [Console]::IsInputRedirected) {
-                Write-Host ("  > [{0}] {1}" -f ($i + 1), $Items[$i]) -ForegroundColor Green
+            $row = "[{0}] {1}" -f ($i + 1), $Items[$i]
+            if ($i -eq $index -and $interactive) {
+                Write-Host ("  > " + $row) -ForegroundColor Green
             }
             else {
-                Write-Host ("    [{0}] {1}" -f ($i + 1), $Items[$i])
+                Write-Host ("    " + $row)
             }
         }
         Write-Host ''
         if ($ZeroLabel) { Write-Host ("    [0] {0}" -f $ZeroLabel) }
         Write-Host ''
         Write-Host $Hint -ForegroundColor DarkGray
-        if ([Console]::IsInputRedirected) {
-            $typed = Read-Host 'Choice'
+        if (-not $interactive) {
+            $typed = Read-Host 'Type a number'
             if ([string]::IsNullOrWhiteSpace($typed)) { return -1 }
             if ($typed -eq '0') { return -1 }
             if ($typed -match '^\d+$') {
@@ -1118,16 +1168,19 @@ function Read-ArrowMenu {
             }
             continue
         }
-        $key = [Console]::ReadKey($true)
-        switch ($key.Key) {
-            'UpArrow' { if ($index -gt 0) { $index-- } else { $index = $Items.Count - 1 }; continue }
-            'DownArrow' { if ($index -lt ($Items.Count - 1)) { $index++ } else { $index = 0 }; continue }
-            'Enter' { return $index }
-            'Escape' { return -1 }
+        $key = Read-SlipKey
+        if ($key.Name -eq 'UpArrow') {
+            if ($index -gt 0) { $index-- } else { $index = $Items.Count - 1 }
+            continue
         }
-        if ($key.KeyChar -eq '0') { return -1 }
-        if ($key.KeyChar -match '\d') {
-            $n = [int][string]$key.KeyChar
+        if ($key.Name -eq 'DownArrow') {
+            if ($index -lt ($Items.Count - 1)) { $index++ } else { $index = 0 }
+            continue
+        }
+        if ($key.Name -eq 'Enter') { return $index }
+        if ($key.Name -eq 'Escape' -or $key.Char -eq '0') { return -1 }
+        if ($key.Char -match '^\d$') {
+            $n = [int]$key.Char
             if ($n -ge 1 -and $n -le $Items.Count) { return ($n - 1) }
         }
     }
@@ -1153,25 +1206,42 @@ function Open-InboxFront {
     $path = Get-InboxPath
     if (-not (Test-Path -LiteralPath $path)) { New-Item -ItemType Directory -Path $path -Force | Out-Null }
     $full = [IO.Path]::GetFullPath($path)
-    try {
-        $shell = New-Object -ComObject Shell.Application
-        foreach ($window in @($shell.Windows())) {
-            try {
-                $location = [string]$window.Document.Folder.Self.Path
-            }
-            catch { continue }
-            if ($location -and ([IO.Path]::GetFullPath($location) -ieq $full)) {
+    $ps = [PowerShell]::Create()
+    [void]$ps.AddScript({
+        param($Folder)
+        try {
+            $shell = New-Object -ComObject Shell.Application
+            foreach ($window in @($shell.Windows())) {
+                try { $location = [string]$window.Document.Folder.Self.Path } catch { continue }
+                if (-not $location) { continue }
+                try { $location = [IO.Path]::GetFullPath($location) } catch { continue }
+                if ($location -ine $Folder) { continue }
+                if (-not ('SlipWin.SlipWindow' -as [type])) {
+                    Add-Type -MemberDefinition '[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow); [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);' -Name SlipWindow -Namespace SlipWin | Out-Null
+                }
                 $hwnd = [IntPtr]$window.HWND
-                $restore = Add-Type -MemberDefinition '[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow); [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);' -Name SlipWindow -Namespace SlipWin -PassThru -ErrorAction SilentlyContinue
-                if (-not $restore) { $restore = [SlipWin.SlipWindow] }
-                [void]$restore::ShowWindow($hwnd, 9)
-                [void]$restore::SetForegroundWindow($hwnd)
-                return
+                [void][SlipWin.SlipWindow]::ShowWindow($hwnd, 9)
+                [void][SlipWin.SlipWindow]::SetForegroundWindow($hwnd)
+                return $true
             }
-        }
+        } catch { }
+        return $false
+    }).AddArgument($full)
+    $handle = $ps.BeginInvoke()
+    $focused = $false
+    if ($handle.AsyncWaitHandle.WaitOne(1500, $false)) {
+        try {
+            $result = @($ps.EndInvoke($handle))
+            if ($result.Count -gt 0 -and $result[-1]) { $focused = $true }
+        } catch { }
     }
-    catch { }
-    Start-Process explorer.exe $full
+    else {
+        try { $ps.Stop() } catch { }
+    }
+    try { $ps.Dispose() } catch { }
+    if (-not $focused) {
+        Start-Process -FilePath (Join-Path $env:WINDIR 'explorer.exe') -ArgumentList $full
+    }
 }
 
 function Send-PresenceBeacon {
@@ -1275,13 +1345,24 @@ function Invoke-QuickUpload {
         [string]$Address,
         [int]$Port,
         [string]$FilePath,
-        [string]$DownloadName
+        [string]$DownloadName,
+        [string]$TargetName
     )
     $file = Get-Item -LiteralPath $FilePath
+    $who = if ($TargetName) { $TargetName } else { $Address }
+    Write-Host ''
+    Write-Host ("Sending {0}  ({1})  to {2}" -f $DownloadName, (Format-ByteSize $file.Length), $who)
+    Write-Host 'Connecting...'
     $client = New-Object System.Net.Sockets.TcpClient
     try {
-        $client.Connect($Address, $Port)
+        $wait = $client.BeginConnect($Address, $Port, $null, $null)
+        if (-not $wait.AsyncWaitHandle.WaitOne(5000, $false)) {
+            throw "Could not reach $who. On that PC, turn Quick receive off and on, then try again."
+        }
+        $client.EndConnect($wait)
         $stream = $client.GetStream()
+        $stream.ReadTimeout = 20000
+        $stream.WriteTimeout = 20000
         $header = "POST /quick HTTP/1.1`r`nHost: {0}`r`nContent-Length: {1}`r`nX-File-Name: {2}`r`nConnection: close`r`n`r`n" -f $Address, $file.Length, $DownloadName
         $headBytes = [Text.Encoding]::ASCII.GetBytes($header)
         $stream.Write($headBytes, 0, $headBytes.Length)
@@ -1293,7 +1374,7 @@ function Invoke-QuickUpload {
                 $stream.Write($buffer, 0, $read)
                 $sent += $read
                 $pct = [int](($sent * 100) / [Math]::Max($file.Length, 1))
-                Write-Host ("`rSending {0,-30} {1,3}%" -f (Get-ShortText $DownloadName 30), $pct) -NoNewline
+                Write-PercentLine -Label ("Sending " + (Get-ShortText $DownloadName 28)) -Percent $pct -Size $file.Length
             }
         }
         finally { $input.Dispose() }
@@ -1302,11 +1383,25 @@ function Invoke-QuickUpload {
         $reader = New-Object IO.StreamReader($stream)
         $status = $reader.ReadLine()
         if ($status -notmatch ' 200 ') { throw "The other PC did not accept the file ($status)." }
-        Write-Host ("Sent to the other PC: {0}" -f $DownloadName) -ForegroundColor Green
+        Write-Host ("Sent {0} ({1}) to {2}" -f $DownloadName, (Format-ByteSize $file.Length), $who) -ForegroundColor Green
     }
     finally {
         try { $client.Close() } catch { }
     }
+}
+
+function New-SlipTcpListener {
+    foreach ($candidate in $script:PortFirst..$script:PortLast) {
+        $tryListen = $null
+        try {
+            $tryListen = New-Object System.Net.Sockets.TcpListener ([Net.IPAddress]::Any, $candidate)
+            $tryListen.Start()
+            return $tryListen
+        } catch {
+            if ($tryListen) { try { $tryListen.Stop() } catch { } }
+        }
+    }
+    throw "No free port between $($script:PortFirst) and $($script:PortLast)."
 }
 
 function Start-QuickListener {
@@ -1319,8 +1414,7 @@ function Start-QuickListener {
     Set-Content -LiteralPath $pidFile -Value $PID -Encoding ASCII
     $udp = New-Object System.Net.Sockets.UdpClient
     $udp.EnableBroadcast = $true
-    $listener = New-Object System.Net.Sockets.TcpListener ([Net.IPAddress]::Any, 0)
-    $listener.Start()
+    $listener = New-SlipTcpListener
     $port = ([Net.IPEndPoint]$listener.LocalEndpoint).Port
     try {
         while ((Get-Content -LiteralPath $flag -Raw -ErrorAction SilentlyContinue) -match 'on') {
@@ -1344,6 +1438,8 @@ function Start-QuickListener {
             $client = $listener.AcceptTcpClient()
             try {
                 $stream = $client.GetStream()
+                $stream.ReadTimeout = 20000
+                $stream.WriteTimeout = 20000
                 $headerText = ''
                 $buffer = New-Object byte[] 1
                 while ($headerText -notmatch "`r`n`r`n" -and $headerText.Length -lt 8192) {
@@ -1381,9 +1477,14 @@ function Start-QuickListener {
                     }
                 }
                 finally { $output.Dispose() }
+                if ($left -ne 0) {
+                    Remove-Item -LiteralPath $dest -Force -ErrorAction SilentlyContinue
+                    throw 'The file stopped before it finished.'
+                }
                 $ok = "HTTP/1.1 200 OK`r`nContent-Length: 2`r`nConnection: close`r`n`r`nOK"
                 $okBytes = [Text.Encoding]::ASCII.GetBytes($ok)
                 $stream.Write($okBytes, 0, $okBytes.Length)
+                $stream.Flush()
                 Open-InboxFront
             }
             catch { }
@@ -1516,7 +1617,7 @@ function Save-RemoteFile {
                     $pct = [int](($readTotal * 100) / $total)
                     if ($pct -gt 100) { $pct = 100 }
                     if ($pct -ne $last) {
-                        Write-PercentLine -Label ("Receiving " + (Get-ShortText $name 32)) -Percent $pct
+                        Write-PercentLine -Label ("Receiving " + (Get-ShortText $name 28)) -Percent $pct -Size ([long]$total)
                         $last = $pct
                     }
                 }
