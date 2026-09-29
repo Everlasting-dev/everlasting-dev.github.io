@@ -3,6 +3,13 @@
 Internal handoff log for Cursor agents and plugins. Newest entries first.
 Read before editing; append after substantive changes.
 
+## 2026-09-29 - Publish transfer debug and local Slip command
+
+- **Why:** Field reports showed the old downloaded command wrappers could be blocked by Defender, and transfer debugging needed a single append-only log.
+- **Changes:** Replaced `get` with the local Slip script that installs `AppData\Local\Slip\slip.ps1`, uses local wrappers/startup commands, adds `Documents\Slip\Debug\transfer-debug.log`, and exposes the Debug folder from More/Status.
+- **Files:** `get`, `AGENT_CHANGELOG.md`
+- **Notes:** Source hash after publish staging: `2B447F53D1162D15F99C18829DDE1F3A8188CBAD08F621D540705A0FF897BEBA`.
+
 ## 2026-09-29 - Quick receive startup fallback and debug logs
 
 - **Why:** The Teensy source installer reached Slip but failed when Windows denied `schtasks /Create` for the Quick receive logon task.

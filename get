@@ -226,38 +226,37 @@ function Set-ProfileBlock {
 function Get-SlipCommandDir {
     Join-Path $env:LOCALAPPDATA $script:AppName
 }
+function Get-InstalledScriptPath {
+    Join-Path (Get-SlipCommandDir) "$($script:CommandName).ps1"
+}
+
+function Update-InstalledSlipScript {
+    $target = Get-InstalledScriptPath
+    $dir = Split-Path -Parent $target
+    if (-not (Test-Path -LiteralPath $dir)) {
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    }
+    if ($PSCommandPath -and (Test-Path -LiteralPath $PSCommandPath)) {
+        Copy-Item -LiteralPath $PSCommandPath -Destination $target -Force
+        return
+    }
+    Invoke-RestMethod -Uri $script:SourceUrl -OutFile $target -ErrorAction Stop
+}
 
 function Install-SlipCommand {
     $dir = Get-SlipCommandDir
     if (-not (Test-Path -LiteralPath $dir)) {
         New-Item -ItemType Directory -Force -Path $dir | Out-Null
     }
-    $getTemp = "%TEMP%\$($script:CommandName)-get.ps1"
-    $listenTemp = "%TEMP%\$($script:CommandName)-listen.ps1"
+    Update-InstalledSlipScript
+    $installedScript = Get-InstalledScriptPath
     $menuCmd = @"
 @echo off
-del /f /q "$getTemp" >nul 2>&1
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }; Invoke-RestMethod -Uri '$($script:SourceUrl)' -OutFile '$getTemp' -ErrorAction Stop"
-if errorlevel 1 exit /b %errorlevel%
-if not exist "$getTemp" exit /b 1
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$getTemp" menu %*
-set "slip_exit=%errorlevel%"
-del /f /q "$getTemp" >nul 2>&1
-exit /b %slip_exit%
-"@
-    $listenCmd = @"
-@echo off
-del /f /q "$listenTemp" >nul 2>&1
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }; Invoke-RestMethod -Uri '$($script:SourceUrl)' -OutFile '$listenTemp' -ErrorAction Stop"
-if errorlevel 1 exit /b %errorlevel%
-if not exist "$listenTemp" exit /b 1
-powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "$listenTemp" listen
-set "slip_exit=%errorlevel%"
-del /f /q "$listenTemp" >nul 2>&1
-exit /b %slip_exit%
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$installedScript" menu %*
+exit /b %errorlevel%
 "@
     Set-Content -LiteralPath (Join-Path $dir "$($script:CommandName).cmd") -Value $menuCmd -Encoding ASCII
-    Set-Content -LiteralPath (Join-Path $dir "$($script:CommandName)-listen.cmd") -Value $listenCmd -Encoding ASCII
+    Remove-Item -LiteralPath (Join-Path $dir "$($script:CommandName)-listen.cmd") -Force -ErrorAction SilentlyContinue
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
     if (-not $userPath) { $userPath = '' }
     $parts = @($userPath -split ';' | Where-Object { $_ -and ($_.TrimEnd('\') -ine $dir.TrimEnd('\')) })
@@ -267,16 +266,7 @@ exit /b %slip_exit%
     if ($env:Path -notlike "*$dir*") { $env:Path = "$dir;$env:Path" }
     $invoke = @"
 function global:$($script:CommandName) {
-    `$tmp = Join-Path `$env:TEMP '$($script:CommandName)-get.ps1'
-    Remove-Item -LiteralPath `$tmp -Force -ErrorAction SilentlyContinue
-    try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
-    Invoke-RestMethod -Uri '$($script:SourceUrl)' -OutFile `$tmp -ErrorAction Stop
-    if (-not (Test-Path -LiteralPath `$tmp)) { throw 'Could not download $($script:AppName).' }
-    try {
-        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File `$tmp menu @args
-    } finally {
-        Remove-Item -LiteralPath `$tmp -Force -ErrorAction SilentlyContinue
-    }
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File '$installedScript' menu @args
 }
 "@
     Invoke-Expression $invoke
@@ -284,7 +274,7 @@ function global:$($script:CommandName) {
 
 function Remove-SlipCommand {
     $dir = Get-SlipCommandDir
-    foreach ($name in @("$($script:CommandName).cmd", "$($script:CommandName)-listen.cmd")) {
+    foreach ($name in @("$($script:CommandName).cmd", "$($script:CommandName)-listen.cmd", "$($script:CommandName).ps1")) {
         $path = Join-Path $dir $name
         if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
     }
@@ -569,7 +559,8 @@ function Show-Status {
     Write-Host ''
     foreach ($pair in @(
         @{ Label = 'Outbox'; Path = (Get-OutboxPath) },
-        @{ Label = 'Inbox'; Path = (Get-InboxPath) }
+        @{ Label = 'Inbox'; Path = (Get-InboxPath) },
+        @{ Label = 'Debug'; Path = (Get-DebugPath) }
     )) {
         if (Test-Path -LiteralPath $pair.Path) {
             $files = @(Get-ChildItem -LiteralPath $pair.Path -Force -File -ErrorAction SilentlyContinue)
@@ -581,6 +572,8 @@ function Show-Status {
             Write-Host ("{0}: missing  {1}" -f $pair.Label, $pair.Path) -ForegroundColor Yellow
         }
     }
+    Write-Host ''
+    Write-Host ("Transfer log: {0}" -f (Get-TransferDebugPath))
     Wait-Enter
 }
 
@@ -619,6 +612,11 @@ function Get-OutboxItems {
         Sort-Object -Property @{ Expression = { if ($_.PSIsContainer) { 0 } else { 1 } } }, Name)
 }
 
+function Open-DebugFolder {
+    Ensure-SlipFiles | Out-Null
+    Open-Folder (Get-DebugPath)
+}
+
 function Write-SlipLog {
     param([string]$Message)
     try {
@@ -628,6 +626,39 @@ function Write-SlipLog {
         }
         $line = '{0} {1}' -f (Get-Date -Format 'o'), ($Message -replace '[\r\n]+', ' ')
         Add-Content -LiteralPath (Join-Path $debug "$($script:CommandName).log") -Value $line -Encoding ASCII
+    } catch { }
+}
+
+function Get-TransferDebugPath {
+    Join-Path (Get-DebugPath) 'transfer-debug.log'
+}
+
+function ConvertTo-LogField {
+    param($Value)
+    if ($null -eq $Value) { return '-' }
+    $text = [string]$Value
+    $text = ($text -replace '[\r\n\t|]+', ' ').Trim()
+    if ($text.Length -gt 300) { $text = $text.Substring(0, 300) + '...' }
+    if (-not $text) { return '-' }
+    return $text
+}
+
+function Write-TransferDebug {
+    param([string]$Event, [hashtable]$Fields)
+    try {
+        $debug = Get-DebugPath
+        if (-not (Test-Path -LiteralPath $debug)) {
+            New-Item -ItemType Directory -Force -Path $debug | Out-Null
+        }
+        $pairs = @()
+        if ($Fields) {
+            foreach ($key in ($Fields.Keys | Sort-Object)) {
+                $pairs += ("{0}={1}" -f $key, (ConvertTo-LogField $Fields[$key]))
+            }
+        }
+        $line = '{0} {1}' -f (Get-Date -Format 'o'), (ConvertTo-LogField $Event)
+        if ($pairs.Count -gt 0) { $line += ' | ' + ($pairs -join ' | ') }
+        Add-Content -LiteralPath (Get-TransferDebugPath) -Value $line -Encoding ASCII
     } catch { }
 }
 
@@ -882,11 +913,15 @@ function Test-PinMatch {
 function Handle-HttpClient {
     param($Client, [string]$Token, [string]$Pin, [string]$FilePath, [string]$DownloadName, [switch]$Quiet)
     $Client.ReceiveTimeout = 20000
+    $remote = $null
+    try { $remote = [string]$Client.Client.RemoteEndPoint } catch { $remote = 'unknown' }
     $stream = $Client.GetStream()
     $raw = Read-HttpHeaders $stream
     $line = ($raw -split "`r`n")[0]
+    Write-TransferDebug 'send.pin.http-request' @{ remote = $remote; request = $line; file = $DownloadName }
     if ($line -notmatch '^GET\s+(\S+)\s+HTTP/') {
         Send-HttpText $stream 400 'Bad Request' 'text/plain' 'Bad request'
+        Write-TransferDebug 'send.pin.rejected' @{ remote = $remote; reason = 'bad request'; request = $line }
         return $false
     }
     $target = $Matches[1]
@@ -919,13 +954,17 @@ function Handle-HttpClient {
     }
     if ($path -ne $downloadPath) {
         Send-HttpText $stream 404 'Not Found' 'text/plain' 'Not found'
+        Write-TransferDebug 'send.pin.rejected' @{ remote = $remote; reason = 'not found'; path = $path }
         return $false
     }
     if (-not (Test-PinMatch $given $Pin)) {
         Send-HttpText $stream 401 'Unauthorized' 'text/plain' 'Wrong PIN'
+        Write-TransferDebug 'send.pin.rejected' @{ remote = $remote; reason = 'wrong pin'; path = $path }
         return $false
     }
+    Write-TransferDebug 'send.pin.accepted' @{ remote = $remote; file = $DownloadName; size = (Get-Item -LiteralPath $FilePath).Length }
     Send-FileResponse -Stream $stream -FilePath $FilePath -DownloadName $DownloadName -Quiet:$Quiet
+    Write-TransferDebug 'send.pin.completed' @{ remote = $remote; file = $DownloadName; size = (Get-Item -LiteralPath $FilePath).Length }
     return $true
 }
 
@@ -971,6 +1010,7 @@ function Start-ShareServer {
     $token = ([guid]::NewGuid().ToString('N')).Substring(0, 16)
     $pin = (Get-Random -Minimum 0 -Maximum 1000000).ToString('000000')
     $size = [long](Get-Item -LiteralPath $FilePath).Length
+    Write-TransferDebug 'send.pin.ready' @{ file = $DownloadName; size = $size; port = $port; quiet = [bool]$Quiet }
     $udp = New-Object System.Net.Sockets.UdpClient
     $udp.EnableBroadcast = $true
     $done = $false
@@ -1020,9 +1060,15 @@ function Start-ShareServer {
                 $ok = Handle-HttpClient -Client $client -Token $token -Pin $pin -FilePath $FilePath -DownloadName $DownloadName -Quiet:$Quiet
                 if ($ok) { $done = $true }
             } catch {
+                Write-TransferDebug 'send.pin.failed' @{ file = $DownloadName; error = $_.Exception.Message }
             } finally {
                 try { $client.Close() } catch {}
             }
+        }
+        if ($done) {
+            Write-TransferDebug 'send.pin.finished' @{ file = $DownloadName; size = $size; port = $port }
+        } else {
+            Write-TransferDebug 'send.pin.stopped' @{ file = $DownloadName; size = $size; port = $port }
         }
         if (-not $Quiet) {
             Write-Host ''
@@ -1187,7 +1233,9 @@ function Show-SendFiles {
         Write-Host 'Preparing the transfer...' -ForegroundColor DarkGray
         $payload = $null
         try {
+            Write-TransferDebug 'send.prepare' @{ items = $picked.Count; total = $sendTotal; mode = $(if ($usePin) { 'pin' } else { 'quick' }); target = $(if ($quickTarget) { $quickTarget.Display } else { '-' }) }
             $payload = New-SendPayload $picked
+            Write-TransferDebug 'send.payload-ready' @{ file = $payload.Name; path = $payload.Path; size = $payload.Size; temp = [bool]$payload.Temp }
             if (-not $usePin) {
                 try {
                     Invoke-QuickUpload -Address $quickTarget.IP -Port $quickTarget.Port -FilePath $payload.Path -DownloadName $payload.Name -TargetName $quickTarget.Display
@@ -1201,6 +1249,7 @@ function Show-SendFiles {
                 [void](Start-ShareServer -FilePath $payload.Path -DownloadName $payload.Name -TempToDelete $payload.Temp)
             }
         } catch {
+            Write-TransferDebug 'send.failed' @{ error = $_.Exception.Message }
             Write-Host $_.Exception.Message -ForegroundColor Red
             if ($payload -and $payload.Temp) {
                 Remove-Item -LiteralPath $payload.Temp -Force -ErrorAction SilentlyContinue
@@ -1402,8 +1451,8 @@ function Get-QuickPath { Join-Path (Get-SlipRoot) 'quick.txt' }
 function Get-ListenPidPath { Join-Path (Get-SlipCommandDir) 'listen.pid' }
 
 function Get-QuickReceiveCommandLine {
-    $cmd = Join-Path (Get-SlipCommandDir) "$($script:CommandName)-listen.cmd"
-    return "`"$env:ComSpec`" /d /c `"`"$cmd`"`""
+    $scriptPath = Get-InstalledScriptPath
+    return "`"powershell.exe`" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`" listen"
 }
 
 function Test-QuickReceive {
@@ -1528,9 +1577,9 @@ function Register-QuickReceiveStartup {
 }
 
 function Start-QuickReceiveProcess {
-    $cmd = Join-Path (Get-SlipCommandDir) "$($script:CommandName)-listen.cmd"
-    $args = "/d /c `"`"$cmd`"`""
-    Start-Process -FilePath $env:ComSpec -ArgumentList $args -WindowStyle Hidden -ErrorAction Stop | Out-Null
+    $scriptPath = Get-InstalledScriptPath
+    $args = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`" listen"
+    Start-Process -FilePath powershell.exe -ArgumentList $args -WindowStyle Hidden -ErrorAction Stop | Out-Null
 }
 
 function Stop-QuickReceive {
@@ -1598,6 +1647,7 @@ function Invoke-QuickUpload {
     Write-Host ''
     Write-Host ("Sending {0}  ({1})  to {2}" -f $DownloadName, (Format-ByteSize $file.Length), $who)
     Write-Host 'Connecting...'
+    Write-TransferDebug 'send.quick.start' @{ target = $who; address = $Address; port = $Port; file = $DownloadName; size = $file.Length }
     $client = New-Object System.Net.Sockets.TcpClient
     try {
         $wait = $client.BeginConnect($Address, $Port, $null, $null)
@@ -1631,6 +1681,11 @@ function Invoke-QuickUpload {
         $status = $reader.ReadLine()
         if ($status -notmatch ' 200 ') { throw "The other PC did not accept the file ($status)." }
         Write-Host ("Sent {0} ({1}) to {2}" -f $DownloadName, (Format-ByteSize $file.Length), $who) -ForegroundColor Green
+        Write-TransferDebug 'send.quick.completed' @{ target = $who; address = $Address; port = $Port; file = $DownloadName; size = $file.Length; status = $status }
+    }
+    catch {
+        Write-TransferDebug 'send.quick.failed' @{ target = $who; address = $Address; port = $Port; file = $DownloadName; size = $file.Length; error = $_.Exception.Message }
+        throw
     }
     finally {
         try { $client.Close() } catch { }
@@ -1663,6 +1718,7 @@ function Start-QuickListener {
     $udp.EnableBroadcast = $true
     $listener = New-SlipTcpListener
     $port = ([Net.IPEndPoint]$listener.LocalEndpoint).Port
+    Write-TransferDebug 'quick.listener.started' @{ port = $port; pid = $PID; name = (Get-DisplayName) }
     try {
         while ((Get-Content -LiteralPath $flag -Raw -ErrorAction SilentlyContinue) -match 'on') {
             $name = $script:AppName
@@ -1685,12 +1741,17 @@ function Start-QuickListener {
             $client = $listener.AcceptTcpClient()
             $savedPath = $null
             try {
+                $remote = 'unknown'
+                try { $remote = [string]$client.Client.RemoteEndPoint } catch { }
                 $stream = $client.GetStream()
                 $stream.ReadTimeout = 20000
                 $stream.WriteTimeout = 20000
                 $headerText = Read-HttpHeaders $stream
+                $firstLine = ($headerText -split "`r`n")[0]
+                Write-TransferDebug 'quick.receive.request' @{ remote = $remote; request = $firstLine; port = $port }
                 if ($headerText -notmatch '^POST\s+/quick\s+HTTP/') {
                     Send-HttpText $stream 404 'Not Found' 'text/plain' 'Not found'
+                    Write-TransferDebug 'quick.receive.rejected' @{ remote = $remote; reason = 'not quick post'; request = $firstLine }
                     continue
                 }
                 $length = 0L
@@ -1734,9 +1795,11 @@ function Start-QuickListener {
                 $stream.Flush()
                 $savedPath = $dest
                 Write-SlipLog "Quick receive saved: $dest"
+                Write-TransferDebug 'quick.receive.saved' @{ remote = $remote; file = $fileName; path = $dest; size = $length }
             }
             catch {
                 Write-SlipLog "Quick receive failed: $($_.Exception.Message)"
+                Write-TransferDebug 'quick.receive.failed' @{ error = $_.Exception.Message }
             }
             finally {
                 try { $client.Close() } catch { }
@@ -1860,6 +1923,13 @@ function Save-RemoteFile {
     if (-not (Test-Path -LiteralPath $Directory)) {
         New-Item -ItemType Directory -Force -Path $Directory | Out-Null
     }
+    $uriInfo = $null
+    try { $uriInfo = [Uri]$Url } catch { }
+    if ($uriInfo) {
+        Write-TransferDebug 'receive.pin.start' @{ address = $uriInfo.Host; port = $uriInfo.Port; directory = $Directory }
+    } else {
+        Write-TransferDebug 'receive.pin.start' @{ address = 'unknown'; directory = $Directory }
+    }
     $client = New-Object System.Net.Http.HttpClient
     $client.Timeout = [TimeSpan]::FromHours(6)
     try {
@@ -1878,6 +1948,7 @@ function Save-RemoteFile {
         }
         if (-not $name) { $name = "$($script:AppName)-download" }
         $dest = Get-UniqueFilePath $Directory $name
+        Write-TransferDebug 'receive.pin.headers' @{ file = $name; size = $total; path = $dest }
         $inputStream = $resp.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
         $output = [IO.File]::Create($dest)
         $last = -1
@@ -1905,7 +1976,11 @@ function Save-RemoteFile {
             Remove-Item -LiteralPath $dest -Force -ErrorAction SilentlyContinue
             throw "Download stopped early after $(Format-ByteSize $readTotal) of $(Format-ByteSize ([long]$total))."
         }
+        Write-TransferDebug 'receive.pin.saved' @{ file = $name; path = $dest; bytes = $readTotal; expected = $total }
         return $dest
+    } catch {
+        Write-TransferDebug 'receive.pin.failed' @{ error = $_.Exception.Message; directory = $Directory }
+        throw
     } finally {
         $client.Dispose()
     }
@@ -1977,6 +2052,7 @@ function Show-MoreMenu {
             'Remove',
             'Rename this PC',
             'Check connection',
+            'Open Debug folder',
             $quickLabel
         ) -ZeroLabel 'Back'
         switch ($pick) {
@@ -1986,7 +2062,8 @@ function Show-MoreMenu {
             3 { Invoke-RemoveSlip }
             4 { Rename-ThisPc }
             5 { Show-CheckConnection }
-            6 { Set-QuickReceive -On (-not (Test-QuickReceive)) }
+            6 { Open-DebugFolder }
+            7 { Set-QuickReceive -On (-not (Test-QuickReceive)) }
             default { return }
         }
     }
