@@ -13,6 +13,14 @@ $script:RuleTcp = "$($script:AppName) TCP"
 $script:RuleUdp = "$($script:AppName) Discovery"
 $script:BeaconPrefix = $script:AppName.ToUpperInvariant() + '1'
 
+function Initialize-SlipSecurityProtocol {
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    } catch { }
+}
+
+Initialize-SlipSecurityProtocol
+
 function Get-SlipRoot {
     Join-Path (Join-Path $env:USERPROFILE 'Documents') $script:AppName
 }
@@ -112,7 +120,7 @@ function ConvertTo-BeaconField {
 function Get-HowToText {
 @"
 On a PC that has internet, open PowerShell and paste:
-  irm $($script:SourceUrl) | iex
+  powershell -NoProfile -ExecutionPolicy Bypass -Command "`$p=Join-Path `$env:TEMP '$($script:CommandName)-get.ps1'; Invoke-RestMethod -Uri '$($script:SourceUrl)' -OutFile `$p; & `$p"
 Choose [2] Get $($script:AppName).
 The first time, that installs $($script:AppName).
 After that, type $($script:CommandName), or choose [2] Open $($script:AppName).
@@ -174,7 +182,10 @@ function Get-SlipFunctionBlock {
 # >>> $($script:CommandName) >>>
 function $($script:CommandName) {
     `$tmp = Join-Path `$env:TEMP '$($script:CommandName)-get.ps1'
-    Invoke-RestMethod -Uri '$($script:SourceUrl)' -OutFile `$tmp
+    Remove-Item -LiteralPath `$tmp -Force -ErrorAction SilentlyContinue
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
+    Invoke-RestMethod -Uri '$($script:SourceUrl)' -OutFile `$tmp -ErrorAction Stop
+    if (-not (Test-Path -LiteralPath `$tmp)) { throw 'Could not download $($script:AppName).' }
     try {
         & powershell.exe -NoProfile -ExecutionPolicy Bypass -File `$tmp menu @args
     } finally {
@@ -223,15 +234,25 @@ function Install-SlipCommand {
     $listenTemp = "%TEMP%\$($script:CommandName)-listen.ps1"
     $menuCmd = @"
 @echo off
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Invoke-RestMethod -Uri '$($script:SourceUrl)' -OutFile '$getTemp'"
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$getTemp" menu %*
 del /f /q "$getTemp" >nul 2>&1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }; Invoke-RestMethod -Uri '$($script:SourceUrl)' -OutFile '$getTemp' -ErrorAction Stop"
+if errorlevel 1 exit /b %errorlevel%
+if not exist "$getTemp" exit /b 1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$getTemp" menu %*
+set "slip_exit=%errorlevel%"
+del /f /q "$getTemp" >nul 2>&1
+exit /b %slip_exit%
 "@
     $listenCmd = @"
 @echo off
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Invoke-RestMethod -Uri '$($script:SourceUrl)' -OutFile '$listenTemp'"
-powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "$listenTemp" listen
 del /f /q "$listenTemp" >nul 2>&1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }; Invoke-RestMethod -Uri '$($script:SourceUrl)' -OutFile '$listenTemp' -ErrorAction Stop"
+if errorlevel 1 exit /b %errorlevel%
+if not exist "$listenTemp" exit /b 1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "$listenTemp" listen
+set "slip_exit=%errorlevel%"
+del /f /q "$listenTemp" >nul 2>&1
+exit /b %slip_exit%
 "@
     Set-Content -LiteralPath (Join-Path $dir "$($script:CommandName).cmd") -Value $menuCmd -Encoding ASCII
     Set-Content -LiteralPath (Join-Path $dir "$($script:CommandName)-listen.cmd") -Value $listenCmd -Encoding ASCII
@@ -245,7 +266,10 @@ del /f /q "$listenTemp" >nul 2>&1
     $invoke = @"
 function global:$($script:CommandName) {
     `$tmp = Join-Path `$env:TEMP '$($script:CommandName)-get.ps1'
-    Invoke-RestMethod -Uri '$($script:SourceUrl)' -OutFile `$tmp
+    Remove-Item -LiteralPath `$tmp -Force -ErrorAction SilentlyContinue
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
+    Invoke-RestMethod -Uri '$($script:SourceUrl)' -OutFile `$tmp -ErrorAction Stop
+    if (-not (Test-Path -LiteralPath `$tmp)) { throw 'Could not download $($script:AppName).' }
     try {
         & powershell.exe -NoProfile -ExecutionPolicy Bypass -File `$tmp menu @args
     } finally {
@@ -314,7 +338,7 @@ function Invoke-ElevatedEntry {
     if ($PSCommandPath) {
         $argList = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" $Entry"
     } else {
-        $cmd = "`$env:SLIP_ENTRY='$Entry'; iex ((Invoke-RestMethod -Uri '$($script:SourceUrl)').ToString())"
+        $cmd = "`$tmp=Join-Path `$env:TEMP '$($script:CommandName)-admin.ps1'; Remove-Item -LiteralPath `$tmp -Force -ErrorAction SilentlyContinue; try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }; Invoke-RestMethod -Uri '$($script:SourceUrl)' -OutFile `$tmp -ErrorAction Stop; & `$tmp $Entry; exit `$LASTEXITCODE"
         $argList = "-NoProfile -ExecutionPolicy Bypass -Command `"$cmd`""
     }
     try {
@@ -593,6 +617,18 @@ function Get-OutboxItems {
         Sort-Object -Property @{ Expression = { if ($_.PSIsContainer) { 0 } else { 1 } } }, Name)
 }
 
+function Write-SlipLog {
+    param([string]$Message)
+    try {
+        $root = Get-SlipRoot
+        if (-not (Test-Path -LiteralPath $root)) {
+            New-Item -ItemType Directory -Force -Path $root | Out-Null
+        }
+        $line = '{0} {1}' -f (Get-Date -Format 'o'), ($Message -replace '[\r\n]+', ' ')
+        Add-Content -LiteralPath (Join-Path $root "$($script:CommandName).log") -Value $line -Encoding ASCII
+    } catch { }
+}
+
 function Get-TreeSize {
     param($Item)
     if (-not $Item.PSIsContainer) { return [long]$Item.Length }
@@ -601,18 +637,44 @@ function Get-TreeSize {
     return [long]$sum
 }
 
+function Start-ExplorerWindow {
+    param([string]$Argument)
+    $explorer = Join-Path $env:WINDIR 'explorer.exe'
+    try {
+        Start-Process -FilePath $explorer -ArgumentList $Argument -WindowStyle Normal -ErrorAction Stop | Out-Null
+        return $true
+    } catch {
+        Write-SlipLog "Explorer Start-Process failed: $($_.Exception.Message)"
+    }
+    try {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $explorer
+        $psi.Arguments = $Argument
+        $psi.UseShellExecute = $true
+        $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Normal
+        [System.Diagnostics.Process]::Start($psi) | Out-Null
+        return $true
+    } catch {
+        Write-SlipLog "Explorer ShellExecute failed: $($_.Exception.Message)"
+    }
+    return $false
+}
+
 function Open-Folder {
-    param([string]$Path)
+    param([string]$Path, [switch]$Force)
     if (-not (Test-Path -LiteralPath $Path)) {
         New-Item -ItemType Directory -Force -Path $Path | Out-Null
     }
     $full = [IO.Path]::GetFullPath($Path)
-    if (Focus-ExplorerFolder -FolderPath $full) { return }
-    Start-Process -FilePath (Join-Path $env:WINDIR 'explorer.exe') -ArgumentList ("`"{0}`"" -f $full) | Out-Null
+    if (-not $Force -and (Focus-ExplorerFolder -FolderPath $full)) { return }
+    if (Start-ExplorerWindow -Argument ("`"{0}`"" -f $full)) {
+        Start-Sleep -Milliseconds 500
+        [void](Focus-ExplorerFolder -FolderPath $full)
+    }
 }
 
 function Open-ContainingFolder {
-    param([string]$Path)
+    param([string]$Path, [switch]$Force)
     if (-not $Path) { return }
     $full = [IO.Path]::GetFullPath($Path)
     $isFolder = Test-Path -LiteralPath $full -PathType Container
@@ -621,11 +683,16 @@ function Open-ContainingFolder {
         New-Item -ItemType Directory -Force -Path $folder | Out-Null
     }
     if (-not $isFolder -and (Test-Path -LiteralPath $full -PathType Leaf)) {
-        if (Focus-ExplorerFolder -FolderPath $folder -SelectPath $full) { return }
-        Start-Process -FilePath (Join-Path $env:WINDIR 'explorer.exe') -ArgumentList ("/select,`"{0}`"" -f $full) | Out-Null
+        if (-not $Force -and (Focus-ExplorerFolder -FolderPath $folder -SelectPath $full)) { return }
+        if (Start-ExplorerWindow -Argument ("/select,`"{0}`"" -f $full)) {
+            Start-Sleep -Milliseconds 500
+            [void](Focus-ExplorerFolder -FolderPath $folder -SelectPath $full)
+        } else {
+            Open-Folder $folder -Force:$Force
+        }
         return
     }
-    Open-Folder $folder
+    Open-Folder $folder -Force:$Force
 }
 
 function Focus-ExplorerFolder {
@@ -1407,8 +1474,19 @@ function Stop-PresenceLoop {
 function Start-QuickReceiveTask {
     $cmd = Join-Path (Get-SlipCommandDir) "$($script:CommandName)-listen.cmd"
     $taskName = Get-QuickTaskName
-    $action = "schtasks /Create /TN `"$taskName`" /SC ONLOGON /RL LIMITED /F /TR `"$cmd`""
-    cmd /c $action | Out-Null
+    $taskRun = "`"$env:ComSpec`" /d /c `"`"$cmd`"`""
+    $output = & schtasks.exe /Create /TN $taskName /SC ONLOGON /RL LIMITED /F /TR $taskRun 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        $text = (@($output) -join ' ').Trim()
+        if (-not $text) { $text = "exit code $LASTEXITCODE" }
+        throw "Could not create the Quick receive logon task ($text)."
+    }
+}
+
+function Start-QuickReceiveProcess {
+    $cmd = Join-Path (Get-SlipCommandDir) "$($script:CommandName)-listen.cmd"
+    $args = "/d /c `"`"$cmd`"`""
+    Start-Process -FilePath $env:ComSpec -ArgumentList $args -WindowStyle Hidden -ErrorAction Stop | Out-Null
 }
 
 function Stop-QuickReceive {
@@ -1425,7 +1503,7 @@ function Stop-QuickReceive {
         Remove-Item -LiteralPath $pidPath -Force -ErrorAction SilentlyContinue
     }
     $taskName = Get-QuickTaskName
-    cmd /c "schtasks /Delete /TN `"$taskName`" /F" 2>$null | Out-Null
+    & schtasks.exe /Delete /TN $taskName /F 2>$null | Out-Null
 }
 
 function Enable-QuickReceive {
@@ -1434,8 +1512,7 @@ function Enable-QuickReceive {
     Set-QuickReceiveFlag $true
     Install-SlipCommand
     Start-QuickReceiveTask
-    $cmd = Join-Path (Get-SlipCommandDir) "$($script:CommandName)-listen.cmd"
-    Start-Process -FilePath $cmd -WindowStyle Hidden
+    Start-QuickReceiveProcess
     if (-not $Quiet) {
         Write-Host 'Quick receive is on. This PC can take a file with no PIN.' -ForegroundColor Green
     }
@@ -1552,6 +1629,7 @@ function Start-QuickListener {
                 continue
             }
             $client = $listener.AcceptTcpClient()
+            $savedPath = $null
             try {
                 $stream = $client.GetStream()
                 $stream.ReadTimeout = 20000
@@ -1575,8 +1653,7 @@ function Start-QuickListener {
                 elseif ($fileName) {
                     try { $fileName = [Uri]::UnescapeDataString($fileName) } catch { }
                 }
-                $fileName = [IO.Path]::GetFileName($fileName)
-                if ([string]::IsNullOrWhiteSpace($fileName)) { $fileName = "$($script:CommandName)-file.bin" }
+                $fileName = ConvertTo-SafeFileName -Name $fileName -Fallback "$($script:CommandName)-file.bin"
                 $inbox = Join-Path $root 'Inbox'
                 if (-not (Test-Path -LiteralPath $inbox)) { New-Item -ItemType Directory -Path $inbox -Force | Out-Null }
                 $dest = Get-UniqueFilePath -Directory $inbox -Name $fileName
@@ -1601,15 +1678,27 @@ function Start-QuickListener {
                 $okBytes = [Text.Encoding]::ASCII.GetBytes($ok)
                 $stream.Write($okBytes, 0, $okBytes.Length)
                 $stream.Flush()
-                Open-ContainingFolder $dest
+                $savedPath = $dest
+                Write-SlipLog "Quick receive saved: $dest"
             }
-            catch { }
-            finally { $client.Close() }
+            catch {
+                Write-SlipLog "Quick receive failed: $($_.Exception.Message)"
+            }
+            finally {
+                try { $client.Close() } catch { }
+            }
+            if ($savedPath) {
+                try {
+                    Open-ContainingFolder $savedPath -Force
+                } catch {
+                    Write-SlipLog "Could not open Inbox for ${savedPath}: $($_.Exception.Message)"
+                }
+            }
         }
     }
     finally {
-        $listener.Stop()
-        $udp.Close()
+        try { $listener.Stop() } catch { }
+        try { $udp.Close() } catch { }
         Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue
     }
 }
@@ -1681,10 +1770,25 @@ function Show-CheckConnection {
     }
 }
 
+function ConvertTo-SafeFileName {
+    param([string]$Name, [string]$Fallback)
+    $leaf = [IO.Path]::GetFileName($Name)
+    if ([string]::IsNullOrWhiteSpace($leaf)) { $leaf = $Fallback }
+    foreach ($ch in [IO.Path]::GetInvalidFileNameChars()) {
+        $leaf = $leaf.Replace([string]$ch, '_')
+    }
+    $leaf = $leaf.Trim()
+    if ([string]::IsNullOrWhiteSpace($leaf)) { $leaf = $Fallback }
+    $base = [IO.Path]::GetFileNameWithoutExtension($leaf)
+    if (@('CON', 'PRN', 'AUX', 'NUL', 'COM1', 'COM2', 'COM3', 'COM4', 'COM5', 'COM6', 'COM7', 'COM8', 'COM9', 'LPT1', 'LPT2', 'LPT3', 'LPT4', 'LPT5', 'LPT6', 'LPT7', 'LPT8', 'LPT9') -contains $base.ToUpperInvariant()) {
+        $leaf = "_$leaf"
+    }
+    return $leaf
+}
+
 function Get-UniqueFilePath {
     param([string]$Directory, [string]$Name)
-    $leaf = [IO.Path]::GetFileName($Name)
-    if (-not $leaf) { $leaf = "$($script:AppName)-download" }
+    $leaf = ConvertTo-SafeFileName -Name $Name -Fallback "$($script:AppName)-download"
     $dest = Join-Path $Directory $leaf
     $base = [IO.Path]::GetFileNameWithoutExtension($leaf)
     $ext = [IO.Path]::GetExtension($leaf)
@@ -1798,7 +1902,7 @@ function Show-ReceiveFiles {
             $saved = Save-RemoteFile -Url $url -Directory (Get-InboxPath)
             Write-Host ''
             Write-Host "Saved to $saved" -ForegroundColor Green
-            Open-ContainingFolder $saved
+            Open-ContainingFolder $saved -Force
             Wait-Enter
             return
         } catch {
@@ -2077,6 +2181,9 @@ switch ($script:Opt.Entry) {
             try {
                 $saved = Save-RemoteFile -Url $url -Directory $destDir -Quiet
                 [Console]::Out.WriteLine($saved)
+                if (-not $script:Opt.Quiet) {
+                    Open-ContainingFolder $saved -Force
+                }
                 Exit-Slip 0
             } catch {
                 [Console]::Error.WriteLine($_.Exception.Message)
