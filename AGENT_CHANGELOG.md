@@ -3,6 +3,13 @@
 Internal handoff log for Cursor agents and plugins. Newest entries first.
 Read before editing; append after substantive changes.
 
+## 2026-09-29 - Clarify Repair command wording
+
+- **Why:** A report showed Repair could finish successfully, but typing `slip` in the already-open parent shell still failed because that shell had not refreshed PATH.
+- **Changes:** Updated `get` so Repair tells users that new windows can type `slip`, while already-open windows can run the full local `slip.cmd` path immediately.
+- **Files:** `get`, `AGENT_CHANGELOG.md`
+- **Notes:** Source hash after publish staging: `F362EC6D1D1DEE99F9E449CAA4B580D7C3F0882E7178E4B6549067EA489562B1`.
+
 ## 2026-09-29 - Publish transfer debug and local Slip command
 
 - **Why:** Field reports showed the old downloaded command wrappers could be blocked by Defender, and transfer debugging needed a single append-only log.
