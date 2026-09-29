@@ -120,7 +120,7 @@ function ConvertTo-BeaconField {
 function Get-HowToText {
 @"
 On a PC that has internet, open PowerShell and paste:
-  powershell -NoProfile -ExecutionPolicy Bypass -Command "`$p=Join-Path `$env:TEMP '$($script:CommandName)-get.ps1'; Invoke-RestMethod -Uri '$($script:SourceUrl)' -OutFile `$p; & `$p"
+  powershell -NoProfile -ExecutionPolicy Bypass -Command "`$p=Join-Path `$env:TEMP '$($script:CommandName)-get.ps1'; Remove-Item -LiteralPath `$p -Force -ErrorAction SilentlyContinue; try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }; Invoke-RestMethod -Uri '$($script:SourceUrl)' -OutFile `$p -ErrorAction Stop; & `$p"
 Choose [2] Get $($script:AppName).
 The first time, that installs $($script:AppName).
 After that, type $($script:CommandName), or choose [2] Open $($script:AppName).
