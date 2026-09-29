@@ -237,6 +237,9 @@ function Update-InstalledSlipScript {
         New-Item -ItemType Directory -Force -Path $dir | Out-Null
     }
     if ($PSCommandPath -and (Test-Path -LiteralPath $PSCommandPath)) {
+        $sourcePath = [IO.Path]::GetFullPath($PSCommandPath)
+        $targetPath = [IO.Path]::GetFullPath($target)
+        if ($sourcePath -ieq $targetPath) { return }
         Copy-Item -LiteralPath $PSCommandPath -Destination $target -Force
         return
     }
@@ -409,6 +412,7 @@ function Invoke-UnattendedInstall {
         if ($QuickReceive) {
             Enable-QuickReceive -Quiet:$Quiet
         }
+        Write-SlipLog "Install completed. quickReceive=$([bool]$QuickReceive)."
         if (-not $Quiet) {
             Write-Host "$($script:AppName) is ready." -ForegroundColor Green
             Write-Host ("Shown as: {0}" -f (Get-DisplayName))
@@ -424,6 +428,44 @@ function Invoke-UnattendedInstall {
     if (-not $Quiet) {
         Write-Host "$($script:AppName) was not installed." -ForegroundColor Red
     }
+    return $false
+}
+
+function Invoke-UnattendedUpgrade {
+    param([string]$DisplayName, [switch]$QuickReceive, [switch]$Quiet)
+    $name = $null
+    if (-not [string]::IsNullOrWhiteSpace($DisplayName)) {
+        $name = ConvertTo-CleanDisplayName -Name $DisplayName -Fallback $env:COMPUTERNAME
+    }
+    if (-not $Quiet) {
+        Write-Host "Updating $($script:AppName)..." -ForegroundColor Cyan
+    }
+    $ok = Complete-SlipSetup -DisplayName $name -Quiet:$Quiet
+    if ($ok) {
+        $quickShouldRun = $QuickReceive -or (Test-QuickReceive)
+        if ($quickShouldRun) {
+            Enable-QuickReceive -Quiet:$Quiet
+        } else {
+            Remove-QuickReceiveTask
+            Remove-QuickReceiveRunKey
+        }
+        Write-SlipLog "Upgrade completed. quickReceive=$([bool]$quickShouldRun)."
+        if (-not $Quiet) {
+            Write-Host "$($script:AppName) is up to date." -ForegroundColor Green
+            Write-Host ("Shown as: {0}" -f (Get-DisplayName))
+            Write-Host "Command: $($script:CommandName)"
+            if ($quickShouldRun) {
+                Write-Host 'Quick receive: on'
+            } else {
+                Write-Host 'Quick receive: off'
+            }
+        }
+        return $true
+    }
+    if (-not $Quiet) {
+        Write-Host "$($script:AppName) could not be updated." -ForegroundColor Red
+    }
+    Write-SlipLog 'Upgrade failed.'
     return $false
 }
 
@@ -494,7 +536,7 @@ function Show-RepairScreen {
     Write-Host ("Shown to other PCs as: " + (Get-DisplayName))
     Write-Host ''
     Write-Host 'Repair puts the firewall rules and the command back,'
-    Write-Host 'and recreates Outbox or Inbox if those folders are missing.'
+    Write-Host 'recreates missing folders, and refreshes startup.'
     Write-Host ''
     Write-Host 'Repair will not delete files in Outbox or Inbox.' -ForegroundColor Green
     Write-Host ''
@@ -502,6 +544,13 @@ function Show-RepairScreen {
     if ($answer -notmatch '^[Yy]') { return }
     Write-Host ''
     if (Complete-SlipSetup -DisplayName $null) {
+        if (Test-QuickReceive) {
+            Enable-QuickReceive -Quiet
+            Write-Host 'Quick receive startup refreshed.' -ForegroundColor Green
+        } else {
+            Remove-QuickReceiveTask
+            Remove-QuickReceiveRunKey
+        }
         Write-Host 'Repair finished. Your Outbox and Inbox files are still there.' -ForegroundColor Green
         Write-Host "New Command Prompt and PowerShell windows can type: $($script:CommandName)" -ForegroundColor Green
         Write-Host ("Already-open windows can run: {0}" -f (Join-Path (Get-SlipCommandDir) "$($script:CommandName).cmd")) -ForegroundColor DarkGray
@@ -2236,6 +2285,7 @@ function Get-EntryOptions {
         elseif ($token -eq 'recv') { $o.Entry = 'recv' }
         elseif ($token -eq 'listen') { $o.Entry = 'listen' }
         elseif ($token -eq 'install' -or $token -eq 'setup') { $o.Entry = 'install' }
+        elseif ($token -eq 'upgrade' -or $token -eq 'update' -or $token -eq 'migrate' -or $token -eq 'repair') { $o.Entry = 'upgrade' }
         elseif ($token -eq '-Address' -and ($i + 1) -lt $pending.Count) { $i++; $o.Address = [string]$pending[$i] }
         elseif ($token -eq '-Port' -and ($i + 1) -lt $pending.Count) { $i++; $o.Port = [int]$pending[$i] }
         elseif ($token -eq '-Pin' -and ($i + 1) -lt $pending.Count) { $i++; $o.Pin = [string]$pending[$i] }
@@ -2271,6 +2321,21 @@ switch ($script:Opt.Entry) {
             if (-not $script:Opt.Quiet) {
                 [Console]::Error.WriteLine($_.Exception.Message)
             }
+            Exit-Slip 1
+        }
+    }
+    'upgrade' {
+        try {
+            if (Invoke-UnattendedUpgrade -DisplayName $script:Opt.DisplayName -QuickReceive:$script:Opt.QuickReceive -Quiet:$script:Opt.Quiet) {
+                Exit-Slip 0
+            } else {
+                Exit-Slip 1
+            }
+        } catch {
+            if (-not $script:Opt.Quiet) {
+                [Console]::Error.WriteLine($_.Exception.Message)
+            }
+            Write-SlipLog "Upgrade failed: $($_.Exception.Message)"
             Exit-Slip 1
         }
     }
