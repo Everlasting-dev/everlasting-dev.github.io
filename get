@@ -26,10 +26,12 @@ function Get-SlipRoot {
 }
 function Get-OutboxPath { Join-Path (Get-SlipRoot) 'Outbox' }
 function Get-InboxPath { Join-Path (Get-SlipRoot) 'Inbox' }
+function Get-DebugPath { Join-Path (Get-SlipRoot) 'Debug' }
 function Get-HowToPath { Join-Path (Get-SlipRoot) 'HOWTO.txt' }
 function Get-NamePath { Join-Path (Get-SlipRoot) 'name.txt' }
 function Get-InstalledPath { Join-Path (Get-SlipRoot) 'installed.txt' }
 function Get-QuickTaskName { "$($script:AppName) Quick Receive" }
+function Get-QuickRunName { "$($script:AppName)QuickReceive" }
 
 function Test-SlipInstalled {
     Test-Path -LiteralPath (Get-InstalledPath)
@@ -352,7 +354,7 @@ function Invoke-ElevatedEntry {
 
 function Ensure-SlipFiles {
     param([string]$DisplayName)
-    foreach ($dir in @((Get-SlipRoot), (Get-OutboxPath), (Get-InboxPath))) {
+    foreach ($dir in @((Get-SlipRoot), (Get-OutboxPath), (Get-InboxPath), (Get-DebugPath))) {
         if (-not (Test-Path -LiteralPath $dir)) {
             New-Item -ItemType Directory -Force -Path $dir | Out-Null
         }
@@ -620,12 +622,12 @@ function Get-OutboxItems {
 function Write-SlipLog {
     param([string]$Message)
     try {
-        $root = Get-SlipRoot
-        if (-not (Test-Path -LiteralPath $root)) {
-            New-Item -ItemType Directory -Force -Path $root | Out-Null
+        $debug = Get-DebugPath
+        if (-not (Test-Path -LiteralPath $debug)) {
+            New-Item -ItemType Directory -Force -Path $debug | Out-Null
         }
         $line = '{0} {1}' -f (Get-Date -Format 'o'), ($Message -replace '[\r\n]+', ' ')
-        Add-Content -LiteralPath (Join-Path $root "$($script:CommandName).log") -Value $line -Encoding ASCII
+        Add-Content -LiteralPath (Join-Path $debug "$($script:CommandName).log") -Value $line -Encoding ASCII
     } catch { }
 }
 
@@ -1399,6 +1401,11 @@ function Read-ArrowMenu {
 function Get-QuickPath { Join-Path (Get-SlipRoot) 'quick.txt' }
 function Get-ListenPidPath { Join-Path (Get-SlipCommandDir) 'listen.pid' }
 
+function Get-QuickReceiveCommandLine {
+    $cmd = Join-Path (Get-SlipCommandDir) "$($script:CommandName)-listen.cmd"
+    return "`"$env:ComSpec`" /d /c `"`"$cmd`"`""
+}
+
 function Test-QuickReceive {
     $path = Get-QuickPath
     if (-not (Test-Path -LiteralPath $path)) { return $false }
@@ -1472,15 +1479,52 @@ function Stop-PresenceLoop {
 }
 
 function Start-QuickReceiveTask {
-    $cmd = Join-Path (Get-SlipCommandDir) "$($script:CommandName)-listen.cmd"
     $taskName = Get-QuickTaskName
-    $taskRun = "`"$env:ComSpec`" /d /c `"`"$cmd`"`""
+    $taskRun = Get-QuickReceiveCommandLine
     $output = & schtasks.exe /Create /TN $taskName /SC ONLOGON /RL LIMITED /F /TR $taskRun 2>&1
     if ($LASTEXITCODE -ne 0) {
         $text = (@($output) -join ' ').Trim()
         if (-not $text) { $text = "exit code $LASTEXITCODE" }
-        throw "Could not create the Quick receive logon task ($text)."
+        Write-SlipLog "Quick receive scheduled task failed: $text"
+        return $false
     }
+    Write-SlipLog 'Quick receive scheduled task registered.'
+    return $true
+}
+
+function Set-QuickReceiveRunKey {
+    $runPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+    $name = Get-QuickRunName
+    $value = Get-QuickReceiveCommandLine
+    try {
+        if (-not (Test-Path -LiteralPath $runPath)) {
+            New-Item -Path $runPath -Force | Out-Null
+        }
+        New-ItemProperty -LiteralPath $runPath -Name $name -Value $value -PropertyType String -Force | Out-Null
+        Write-SlipLog 'Quick receive startup entry registered.'
+        return $true
+    } catch {
+        Write-SlipLog "Quick receive startup entry failed: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Remove-QuickReceiveRunKey {
+    try {
+        Remove-ItemProperty -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name (Get-QuickRunName) -ErrorAction SilentlyContinue
+    } catch { }
+}
+
+function Register-QuickReceiveStartup {
+    if (Start-QuickReceiveTask) {
+        Remove-QuickReceiveRunKey
+        return 'scheduled task'
+    }
+    if (Set-QuickReceiveRunKey) {
+        return 'startup entry'
+    }
+    Write-SlipLog 'Quick receive will run for this session only; no logon startup registration succeeded.'
+    return 'current session only'
 }
 
 function Start-QuickReceiveProcess {
@@ -1504,6 +1548,7 @@ function Stop-QuickReceive {
     }
     $taskName = Get-QuickTaskName
     & schtasks.exe /Delete /TN $taskName /F 2>$null | Out-Null
+    Remove-QuickReceiveRunKey
 }
 
 function Enable-QuickReceive {
@@ -1511,10 +1556,19 @@ function Enable-QuickReceive {
     Stop-QuickReceive
     Set-QuickReceiveFlag $true
     Install-SlipCommand
-    Start-QuickReceiveTask
-    Start-QuickReceiveProcess
+    $startup = Register-QuickReceiveStartup
+    try {
+        Start-QuickReceiveProcess
+        Write-SlipLog "Quick receive listener started; startup=$startup."
+    } catch {
+        Write-SlipLog "Quick receive listener start failed: $($_.Exception.Message)"
+        if (-not $Quiet) {
+            Write-Host "Quick receive is on, but the listener did not start: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    }
     if (-not $Quiet) {
         Write-Host 'Quick receive is on. This PC can take a file with no PIN.' -ForegroundColor Green
+        Write-Host "Startup: $startup" -ForegroundColor DarkGray
     }
 }
 

@@ -3,6 +3,13 @@
 Internal handoff log for Cursor agents and plugins. Newest entries first.
 Read before editing; append after substantive changes.
 
+## 2026-09-29 - Quick receive startup fallback and debug logs
+
+- **Why:** The Teensy source installer reached Slip but failed when Windows denied `schtasks /Create` for the Quick receive logon task.
+- **Changes:** Replaced `get` with the local Slip script that falls back to a per-user Run startup entry, logs under `Documents\Slip\Debug`, and keeps Quick receive install non-fatal when scheduled tasks are blocked.
+- **Files:** `get`, `AGENT_CHANGELOG.md`
+- **Notes:** Source hash after publish staging: `210735A4659E6103FECB20643588940798DD03A0870E5CDCA630005AC2B76181`.
+
 ## 2026-09-28 — cmd menus and quick send to a chosen PC
 
 - **Why:** the published `get` script should match the Command Prompt menu fix and the Quick receive port fix
