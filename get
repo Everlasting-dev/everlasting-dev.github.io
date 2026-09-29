@@ -1564,15 +1564,17 @@ function Remove-QuickReceiveRunKey {
     } catch { }
 }
 
+function Remove-QuickReceiveTask {
+    $taskName = Get-QuickTaskName
+    & schtasks.exe /Delete /TN $taskName /F 2>$null | Out-Null
+}
+
 function Register-QuickReceiveStartup {
-    if (Start-QuickReceiveTask) {
-        Remove-QuickReceiveRunKey
-        return 'scheduled task'
-    }
+    Remove-QuickReceiveTask
     if (Set-QuickReceiveRunKey) {
-        return 'startup entry'
+        return 'registry startup entry'
     }
-    Write-SlipLog 'Quick receive will run for this session only; no logon startup registration succeeded.'
+    Write-SlipLog 'Quick receive will run for this session only; registry startup registration failed.'
     return 'current session only'
 }
 
@@ -1595,8 +1597,7 @@ function Stop-QuickReceive {
         }
         Remove-Item -LiteralPath $pidPath -Force -ErrorAction SilentlyContinue
     }
-    $taskName = Get-QuickTaskName
-    & schtasks.exe /Delete /TN $taskName /F 2>$null | Out-Null
+    Remove-QuickReceiveTask
     Remove-QuickReceiveRunKey
 }
 

@@ -3,6 +3,13 @@
 Internal handoff log for Cursor agents and plugins. Newest entries first.
 Read before editing; append after substantive changes.
 
+## 2026-09-29 - Registry-first Quick Receive startup
+
+- **Why:** Quick Receive should be present after reboot through the current-user Run registry key.
+- **Changes:** Replaced scheduled-task-first startup with primary `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\SlipQuickReceive` registration and remove any old scheduled task when Quick Receive is enabled or disabled.
+- **Files:** `get`, `AGENT_CHANGELOG.md`
+- **Notes:** Source hash after publish staging: `B6FB6F65362FDECB97C86A82DF31A8A5A325573DEB663226FECF2D99837639F2`.
+
 ## 2026-09-29 - Clarify Repair command wording
 
 - **Why:** A report showed Repair could finish successfully, but typing `slip` in the already-open parent shell still failed because that shell had not refreshed PATH.
