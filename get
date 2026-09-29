@@ -622,6 +622,8 @@ function Show-Status {
         }
     }
     Write-Host ''
+    Show-QuickReceiveStatus
+    Write-Host ''
     Write-Host ("Transfer log: {0}" -f (Get-TransferDebugPath))
     Wait-Enter
 }
@@ -1207,10 +1209,13 @@ function Show-SendFiles {
             }
             if ($choice -match '^[Oo]$') { Open-Folder (Get-OutboxPath); continue }
             if ($choice -match '^\d+$') {
-                $idx = [int]$choice - 1
-                if ($idx -ge 0 -and $idx -lt $items.Count) {
-                    $selected[$idx] = -not $selected[$idx]
-                    $cursor = $idx
+                $number = 0
+                if ([int]::TryParse($choice, [ref]$number)) {
+                    $idx = $number - 1
+                    if ($idx -ge 0 -and $idx -lt $items.Count) {
+                        $selected[$idx] = -not $selected[$idx]
+                        $cursor = $idx
+                    }
                 }
                 continue
             }
@@ -1261,12 +1266,24 @@ function Show-SendFiles {
         if ($quick.Count -eq 0) {
             Write-Host ''
             Write-Host 'No other PC with Quick receive was found.' -ForegroundColor Yellow
-            Write-Host 'Open More on that PC and turn Quick receive on, then try again.'
-            $pinInstead = Read-Host 'Send with a PIN from this PC instead? [Y/N]'
-            if ($pinInstead -notmatch '^[Yy]') { return }
+            Write-Host 'If Quick receive is on but discovery is blocked, type that PC''s IP.'
+            $fallback = Read-Host '[I] Type IP  [P] Send with PIN  [Q] Back'
+            if ($fallback -match '^[Ii]') {
+                $manual = Read-QuickReceiveTargetByIp
+                if (-not $manual) { return }
+                $usePin = $false
+                $quickTarget = $manual
+            }
+            elseif ($fallback -match '^[PpYy]') {
+                $usePin = $true
+            }
+            else {
+                return
+            }
         }
         else {
             $labels = @($quick | ForEach-Object { "{0} ({1})  {2}" -f $_.Display, $_.Windows, $_.IP })
+            $labels += 'Type IP for Quick receive'
             $labels += 'Send with a PIN instead'
             $how = Read-ArrowMenu -Title 'Choose a PC' -Lines @(
                 ("This send is {0}." -f (Format-ByteSize $sendTotal)),
@@ -1276,6 +1293,12 @@ function Show-SendFiles {
             if ($how -lt $quick.Count) {
                 $usePin = $false
                 $quickTarget = $quick[$how]
+            }
+            elseif ($how -eq $quick.Count) {
+                $manual = Read-QuickReceiveTargetByIp
+                if (-not $manual) { return }
+                $usePin = $false
+                $quickTarget = $manual
             }
         }
         Write-Host ''
@@ -1498,10 +1521,98 @@ function Read-ArrowMenu {
 
 function Get-QuickPath { Join-Path (Get-SlipRoot) 'quick.txt' }
 function Get-ListenPidPath { Join-Path (Get-SlipCommandDir) 'listen.pid' }
+function Get-ListenPortPath { Join-Path (Get-SlipCommandDir) 'listen.port' }
 
 function Get-QuickReceiveCommandLine {
     $scriptPath = Get-InstalledScriptPath
     return "`"powershell.exe`" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`" listen"
+}
+
+function Get-QuickReceiveRunValue {
+    try {
+        return [string](Get-ItemPropertyValue -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name (Get-QuickRunName) -ErrorAction Stop)
+    } catch {
+        return ''
+    }
+}
+
+function Get-QuickListenerPid {
+    $pidPath = Get-ListenPidPath
+    if (-not (Test-Path -LiteralPath $pidPath)) { return 0 }
+    $listenPid = 0
+    if ([int]::TryParse((Get-Content -LiteralPath $pidPath -Raw -ErrorAction SilentlyContinue).Trim(), [ref]$listenPid)) {
+        return $listenPid
+    }
+    return 0
+}
+
+function Test-QuickListenerAlive {
+    $listenPid = Get-QuickListenerPid
+    if ($listenPid -le 0) { return $false }
+    return $null -ne (Get-Process -Id $listenPid -ErrorAction SilentlyContinue)
+}
+
+function Get-QuickListenerPorts {
+    $ports = @()
+    $portPath = Get-ListenPortPath
+    if (Test-Path -LiteralPath $portPath) {
+        $port = 0
+        if ([int]::TryParse((Get-Content -LiteralPath $portPath -Raw -ErrorAction SilentlyContinue).Trim(), [ref]$port)) {
+            if ($port -gt 0) { $ports += $port }
+        }
+    }
+    $listenPid = Get-QuickListenerPid
+    if ($listenPid -gt 0) {
+        try {
+            $ports += @(Get-NetTCPConnection -State Listen -OwningProcess $listenPid -ErrorAction Stop |
+                Where-Object { $_.LocalPort -ge $script:PortFirst -and $_.LocalPort -le $script:PortLast } |
+                Select-Object -ExpandProperty LocalPort)
+        } catch { }
+    }
+    return @($ports | Where-Object { $_ } | Sort-Object -Unique)
+}
+
+function Show-QuickReceiveStatus {
+    $quickOn = Test-QuickReceive
+    if ($quickOn) { Write-Host 'Quick receive: on' -ForegroundColor Green }
+    else { Write-Host 'Quick receive: off' -ForegroundColor Yellow }
+
+    $runValue = Get-QuickReceiveRunValue
+    if ($quickOn) {
+        if ($runValue) {
+            Write-Host 'Startup:       registry entry present' -ForegroundColor Green
+        } else {
+            Write-Host 'Startup:       registry entry missing' -ForegroundColor Yellow
+        }
+    } else {
+        if ($runValue) {
+            Write-Host 'Startup:       stale registry entry present' -ForegroundColor Yellow
+        } else {
+            Write-Host 'Startup:       off'
+        }
+    }
+
+    $listenPid = Get-QuickListenerPid
+    if ($listenPid -le 0) {
+        Write-Host 'Listener:      not running' -ForegroundColor Yellow
+        return
+    }
+    if (-not (Test-QuickListenerAlive)) {
+        Write-Host ("Listener:      pid {0} is not running" -f $listenPid) -ForegroundColor Yellow
+        return
+    }
+
+    $ports = @(Get-QuickListenerPorts)
+    if ($ports.Count -eq 0) {
+        Write-Host ("Listener:      pid {0} alive, port unknown" -f $listenPid) -ForegroundColor Yellow
+        return
+    }
+
+    $checks = @()
+    foreach ($port in $ports) {
+        $checks += ("{0} {1}" -f $port, (Format-Check (Test-TcpOpen '127.0.0.1' $port)))
+    }
+    Write-Host ("Listener:      pid {0}, port {1}" -f $listenPid, ($checks -join ', ')) -ForegroundColor Green
 }
 
 function Test-QuickReceive {
@@ -1607,6 +1718,34 @@ function Set-QuickReceiveRunKey {
     }
 }
 
+function Find-OpenTransferPort {
+    param([string]$Address)
+    foreach ($candidate in $script:PortFirst..$script:PortLast) {
+        if (Test-TcpOpen $Address $candidate) { return $candidate }
+    }
+    return 0
+}
+
+function Read-QuickReceiveTargetByIp {
+    $ip = Read-Host 'Quick receive IP'
+    if ([string]::IsNullOrWhiteSpace($ip)) { return $null }
+    $ip = $ip.Trim()
+    Write-Host "Checking $ip..." -ForegroundColor DarkGray
+    $port = Find-OpenTransferPort -Address $ip
+    if ($port -le 0) {
+        Write-Host 'No Quick receive port answered on that IP.' -ForegroundColor Yellow
+        Write-Host 'On that PC, run the updater or turn Quick receive off and on, then try again.'
+        Wait-Enter
+        return $null
+    }
+    return [pscustomobject]@{
+        IP = $ip
+        Port = $port
+        Display = $ip
+        Windows = 'manual'
+    }
+}
+
 function Remove-QuickReceiveRunKey {
     try {
         Remove-ItemProperty -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name (Get-QuickRunName) -ErrorAction SilentlyContinue
@@ -1646,6 +1785,7 @@ function Stop-QuickReceive {
         }
         Remove-Item -LiteralPath $pidPath -Force -ErrorAction SilentlyContinue
     }
+    Remove-Item -LiteralPath (Get-ListenPortPath) -Force -ErrorAction SilentlyContinue
     Remove-QuickReceiveTask
     Remove-QuickReceiveRunKey
 }
@@ -1768,6 +1908,7 @@ function Start-QuickListener {
     $udp.EnableBroadcast = $true
     $listener = New-SlipTcpListener
     $port = ([Net.IPEndPoint]$listener.LocalEndpoint).Port
+    Set-Content -LiteralPath (Get-ListenPortPath) -Value $port -Encoding ASCII
     Write-TransferDebug 'quick.listener.started' @{ port = $port; pid = $PID; name = (Get-DisplayName) }
     try {
         while ((Get-Content -LiteralPath $flag -Raw -ErrorAction SilentlyContinue) -match 'on') {
@@ -1867,6 +2008,7 @@ function Start-QuickListener {
         try { $listener.Stop() } catch { }
         try { $udp.Close() } catch { }
         Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath (Get-ListenPortPath) -Force -ErrorAction SilentlyContinue
     }
 }
 

@@ -3,11 +3,18 @@
 Internal handoff log for Cursor agents and plugins. Newest entries first.
 Read before editing; append after substantive changes.
 
+## 2026-09-29 - old PC rescue and Quick Receive diagnostics
+
+- **Why:** One upgraded PC still used an old PowerShell profile function that launched `slip.ps1` without `-ExecutionPolicy Bypass`, Repair hit the old self-copy bug, a pasted/repeated number crashed the send picker, and Quick Receive discovery needed a fallback when UDP beacons do not appear.
+- **Changes:** Documented the `-NoProfile` online updater as the rescue path for old profile functions, made the send file picker ignore oversized numeric input instead of throwing, added manual-IP Quick Receive sending with port scanning, and expanded Status to show Quick Receive state, registry startup, listener PID, and open port. The listener now writes `listen.port` beside `listen.pid`.
+- **Files:** `lanfile.ps1`, `UI.md`, `AGENT_CHANGELOG.md`
+- **Notes:** If a receiving PC does not show up but Status says the listener is alive, senders can choose Type IP for Quick receive and enter the receiver's LAN address.
+
 ## 2026-09-29 - existing install upgrade path
 
 - **Why:** PCs that already used an older Slip installer need a one-step migration to the local `slip.ps1`, registry Quick Receive startup, and newer debug logging without deleting user files.
-- **Changes:** Added `upgrade` / `update` / `migrate` / `repair` command-line entries, made Repair refresh Quick Receive startup when it is already on, preserved existing display names during upgrades, skipped self-copy when Slip is already running from its installed local script, added `upgrade-existing-slip.ps1` plus `upgrade-existing-slip.cmd`, and switched the source Teensy payloads to the upgrade entry.
-- **Files:** `lanfile.ps1`, `UI.md`, `upgrade-existing-slip.ps1`, `upgrade-existing-slip.cmd`, `teensy-slip-installer/teensy-slip-installer.ino`, `teensy-slip-installer-source-debug/teensy-slip-installer-source-debug.ino`, `AGENT_CHANGELOG.md`
+- **Changes:** Added `upgrade` / `update` / `migrate` / `repair` command-line entries, made Repair refresh Quick Receive startup when it is already on, preserved existing display names during upgrades, skipped self-copy when Slip is already running from its installed local script, added `upgrade-existing-slip.ps1` plus `upgrade-existing-slip.cmd`, and switched the Teensy installer payloads to the upgrade entry.
+- **Files:** `lanfile.ps1`, `UI.md`, `upgrade-existing-slip.ps1`, `upgrade-existing-slip.cmd`, `teensy-slip-installer/teensy-slip-installer.ino`, `teensy-slip-installer-source-debug/teensy-slip-installer-source-debug.ino`, `teensy-slip-installer-lan/teensy-slip-installer-lan.ino`, `AGENT_CHANGELOG.md`
 - **Notes:** Run `slip upgrade -QuickReceive -Quiet` on old PCs, or use the online updater command from `UI.md` if `slip` is not recognized.
 
 ## 2026-09-29 - registry-first Quick Receive startup
