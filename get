@@ -1,4 +1,4 @@
-# Slip — launcher (Get Octane / Get Slip) and LAN file transfer.
+# Slip - launcher (Get Octane / Get Slip) and LAN file transfer.
 # Published as https://everlasting-dev.github.io/get
 # Rename the app in $script:AppName. The command, folders, and firewall rules follow it.
 $script:AppName = 'Slip'
@@ -21,6 +21,7 @@ function Get-InboxPath { Join-Path (Get-SlipRoot) 'Inbox' }
 function Get-HowToPath { Join-Path (Get-SlipRoot) 'HOWTO.txt' }
 function Get-NamePath { Join-Path (Get-SlipRoot) 'name.txt' }
 function Get-InstalledPath { Join-Path (Get-SlipRoot) 'installed.txt' }
+function Get-QuickTaskName { "$($script:AppName) Quick Receive" }
 
 function Test-SlipInstalled {
     Test-Path -LiteralPath (Get-InstalledPath)
@@ -30,6 +31,16 @@ function Test-IsAdmin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = New-Object Security.Principal.WindowsPrincipal($id)
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Send-EnvironmentChanged {
+    try {
+        if (-not ('SlipWin.EnvNotify' -as [type])) {
+            Add-Type -Namespace SlipWin -Name EnvNotify -MemberDefinition '[DllImport("user32.dll", SetLastError=true, CharSet=CharSet.Auto)] public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, UIntPtr wParam, string lParam, uint fuFlags, uint uTimeout, out UIntPtr lpdwResult);' | Out-Null
+        }
+        $result = [UIntPtr]::Zero
+        [void][SlipWin.EnvNotify]::SendMessageTimeout([IntPtr]0xffff, 0x1A, [UIntPtr]::Zero, 'Environment', 0x0002, 5000, [ref]$result)
+    } catch { }
 }
 
 function Format-ByteSize {
@@ -208,17 +219,19 @@ function Install-SlipCommand {
     if (-not (Test-Path -LiteralPath $dir)) {
         New-Item -ItemType Directory -Force -Path $dir | Out-Null
     }
+    $getTemp = "%TEMP%\$($script:CommandName)-get.ps1"
+    $listenTemp = "%TEMP%\$($script:CommandName)-listen.ps1"
     $menuCmd = @"
 @echo off
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Invoke-RestMethod -Uri '$($script:SourceUrl)' -OutFile '%TEMP%\slip-get.ps1'"
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%TEMP%\slip-get.ps1" menu %*
-del /f /q "%TEMP%\slip-get.ps1" >nul 2>&1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Invoke-RestMethod -Uri '$($script:SourceUrl)' -OutFile '$getTemp'"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$getTemp" menu %*
+del /f /q "$getTemp" >nul 2>&1
 "@
     $listenCmd = @"
 @echo off
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Invoke-RestMethod -Uri '$($script:SourceUrl)' -OutFile '%TEMP%\slip-listen.ps1'"
-powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "%TEMP%\slip-listen.ps1" listen
-del /f /q "%TEMP%\slip-listen.ps1" >nul 2>&1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Invoke-RestMethod -Uri '$($script:SourceUrl)' -OutFile '$listenTemp'"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "$listenTemp" listen
+del /f /q "$listenTemp" >nul 2>&1
 "@
     Set-Content -LiteralPath (Join-Path $dir "$($script:CommandName).cmd") -Value $menuCmd -Encoding ASCII
     Set-Content -LiteralPath (Join-Path $dir "$($script:CommandName)-listen.cmd") -Value $listenCmd -Encoding ASCII
@@ -227,10 +240,11 @@ del /f /q "%TEMP%\slip-listen.ps1" >nul 2>&1
     $parts = @($userPath -split ';' | Where-Object { $_ -and ($_.TrimEnd('\') -ine $dir.TrimEnd('\')) })
     $parts += $dir
     [Environment]::SetEnvironmentVariable('Path', ($parts -join ';'), 'User')
+    Send-EnvironmentChanged
     if ($env:Path -notlike "*$dir*") { $env:Path = "$dir;$env:Path" }
     $invoke = @"
 function global:$($script:CommandName) {
-    `$tmp = Join-Path `$env:TEMP 'slip-get.ps1'
+    `$tmp = Join-Path `$env:TEMP '$($script:CommandName)-get.ps1'
     Invoke-RestMethod -Uri '$($script:SourceUrl)' -OutFile `$tmp
     try {
         & powershell.exe -NoProfile -ExecutionPolicy Bypass -File `$tmp menu @args
@@ -252,6 +266,7 @@ function Remove-SlipCommand {
     if ($userPath) {
         $parts = @($userPath -split ';' | Where-Object { $_ -and ($_.TrimEnd('\') -ine $dir.TrimEnd('\')) })
         [Environment]::SetEnvironmentVariable('Path', ($parts -join ';'), 'User')
+        Send-EnvironmentChanged
     }
     Remove-Item -Path "Function:global:$($script:CommandName)" -ErrorAction SilentlyContinue
 }
@@ -328,38 +343,78 @@ function Ensure-SlipFiles {
 }
 
 function Complete-SlipSetup {
-    param([string]$DisplayName)
+    param([string]$DisplayName, [switch]$Quiet)
     Ensure-SlipFiles -DisplayName $DisplayName
     $ready = (Test-FirewallRule $script:RuleTcp) -and (Test-FirewallRule $script:RuleUdp)
     if (-not $ready) {
         if (Test-IsAdmin) {
             Install-FirewallRules
         } else {
-            Write-Host 'Windows needs approval to allow this app on private networks.' -ForegroundColor Yellow
+            if (-not $Quiet) {
+                Write-Host 'Windows needs approval to allow this app on private networks.' -ForegroundColor Yellow
+            }
             $code = Invoke-ElevatedEntry -Entry 'firewall'
             if ($code -ne 0) {
-                Write-Host 'Firewall rules were not added. Setup is not finished.' -ForegroundColor Red
+                if (-not $Quiet) {
+                    Write-Host 'Firewall rules were not added. Setup is not finished.' -ForegroundColor Red
+                }
                 return $false
             }
         }
     }
     $ready = (Test-FirewallRule $script:RuleTcp) -and (Test-FirewallRule $script:RuleUdp)
     if (-not $ready) {
-        Write-Host 'Firewall rules are still missing. Setup is not finished.' -ForegroundColor Red
+        if (-not $Quiet) {
+            Write-Host 'Firewall rules are still missing. Setup is not finished.' -ForegroundColor Red
+        }
         return $false
     }
     Set-Content -LiteralPath (Get-InstalledPath) -Value (Get-Date -Format 'o') -Encoding ASCII
     return $true
 }
 
-function Read-CleanName {
-    param([string]$Fallback)
-    $entered = Read-Host "Display name (Enter keeps $Fallback)"
-    if ([string]::IsNullOrWhiteSpace($entered)) { return $Fallback }
-    $clean = ($entered -replace '[|\r\n]', ' ').Trim()
+function ConvertTo-CleanDisplayName {
+    param([string]$Name, [string]$Fallback)
+    if ([string]::IsNullOrWhiteSpace($Name)) { return $Fallback }
+    $clean = ($Name -replace '[|\r\n]', ' ').Trim()
     if ($clean.Length -gt 40) { $clean = $clean.Substring(0, 40).Trim() }
     if (-not $clean) { return $Fallback }
     return $clean
+}
+
+function Invoke-UnattendedInstall {
+    param([string]$DisplayName, [switch]$QuickReceive, [switch]$Quiet)
+    $name = ConvertTo-CleanDisplayName -Name $DisplayName -Fallback $env:COMPUTERNAME
+    if (-not $Quiet) {
+        Write-Host "Installing $($script:AppName)..." -ForegroundColor Cyan
+    }
+    $ok = Complete-SlipSetup -DisplayName $name -Quiet:$Quiet
+    if ($ok) {
+        if ($QuickReceive) {
+            Enable-QuickReceive -Quiet:$Quiet
+        }
+        if (-not $Quiet) {
+            Write-Host "$($script:AppName) is ready." -ForegroundColor Green
+            Write-Host ("Shown as: {0}" -f (Get-DisplayName))
+            Write-Host "Command: $($script:CommandName)"
+            Write-Host ("Outbox:  {0}" -f (Get-OutboxPath))
+            Write-Host ("Inbox:   {0}" -f (Get-InboxPath))
+            if ($QuickReceive) {
+                Write-Host 'Quick receive: on'
+            }
+        }
+        return $true
+    }
+    if (-not $Quiet) {
+        Write-Host "$($script:AppName) was not installed." -ForegroundColor Red
+    }
+    return $false
+}
+
+function Read-CleanName {
+    param([string]$Fallback)
+    $entered = Read-Host "Display name (Enter keeps $Fallback)"
+    return (ConvertTo-CleanDisplayName -Name $entered -Fallback $Fallback)
 }
 
 function Show-NetworkWarning {
@@ -533,7 +588,9 @@ function Show-HowTo {
 function Get-OutboxItems {
     $path = Get-OutboxPath
     if (-not (Test-Path -LiteralPath $path)) { return @() }
-    return @(Get-ChildItem -LiteralPath $path -Force | Where-Object { $_.Name -notin @('desktop.ini', 'Thumbs.db') })
+    return @(Get-ChildItem -LiteralPath $path -Force |
+        Where-Object { $_.Name -notin @('desktop.ini', 'Thumbs.db') } |
+        Sort-Object -Property @{ Expression = { if ($_.PSIsContainer) { 0 } else { 1 } } }, Name)
 }
 
 function Get-TreeSize {
@@ -549,7 +606,77 @@ function Open-Folder {
     if (-not (Test-Path -LiteralPath $Path)) {
         New-Item -ItemType Directory -Force -Path $Path | Out-Null
     }
-    Start-Process explorer.exe -ArgumentList $Path
+    $full = [IO.Path]::GetFullPath($Path)
+    if (Focus-ExplorerFolder -FolderPath $full) { return }
+    Start-Process -FilePath (Join-Path $env:WINDIR 'explorer.exe') -ArgumentList ("`"{0}`"" -f $full) | Out-Null
+}
+
+function Open-ContainingFolder {
+    param([string]$Path)
+    if (-not $Path) { return }
+    $full = [IO.Path]::GetFullPath($Path)
+    $isFolder = Test-Path -LiteralPath $full -PathType Container
+    $folder = if ($isFolder) { $full } else { Split-Path -Parent $full }
+    if (-not (Test-Path -LiteralPath $folder)) {
+        New-Item -ItemType Directory -Force -Path $folder | Out-Null
+    }
+    if (-not $isFolder -and (Test-Path -LiteralPath $full -PathType Leaf)) {
+        if (Focus-ExplorerFolder -FolderPath $folder -SelectPath $full) { return }
+        Start-Process -FilePath (Join-Path $env:WINDIR 'explorer.exe') -ArgumentList ("/select,`"{0}`"" -f $full) | Out-Null
+        return
+    }
+    Open-Folder $folder
+}
+
+function Focus-ExplorerFolder {
+    param([string]$FolderPath, [string]$SelectPath)
+    $folder = [IO.Path]::GetFullPath($FolderPath)
+    $select = $null
+    if ($SelectPath) { $select = [IO.Path]::GetFullPath($SelectPath) }
+    $ps = [PowerShell]::Create()
+    [void]$ps.AddScript({
+        param($Folder, $Select)
+        try {
+            $shell = New-Object -ComObject Shell.Application
+            foreach ($window in @($shell.Windows())) {
+                try { $location = [string]$window.Document.Folder.Self.Path } catch { continue }
+                if (-not $location) { continue }
+                try { $location = [IO.Path]::GetFullPath($location) } catch { continue }
+                if ($location -ine $Folder) { continue }
+                if ($Select) {
+                    try {
+                        $leaf = [IO.Path]::GetFileName($Select)
+                        $item = $window.Document.Folder.ParseName($leaf)
+                        if ($item) {
+                            $flags = 1 -bor 4 -bor 8 -bor 16
+                            $window.Document.SelectItem($item, $flags)
+                        }
+                    } catch { }
+                }
+                if (-not ('SlipWin.SlipWindow' -as [type])) {
+                    Add-Type -MemberDefinition '[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow); [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);' -Name SlipWindow -Namespace SlipWin | Out-Null
+                }
+                $hwnd = [IntPtr]$window.HWND
+                [void][SlipWin.SlipWindow]::ShowWindow($hwnd, 9)
+                [void][SlipWin.SlipWindow]::SetForegroundWindow($hwnd)
+                return $true
+            }
+        } catch { }
+        return $false
+    }).AddArgument($folder).AddArgument($select)
+    $handle = $ps.BeginInvoke()
+    $focused = $false
+    if ($handle.AsyncWaitHandle.WaitOne(1500, $false)) {
+        try {
+            $result = @($ps.EndInvoke($handle))
+            if ($result.Count -gt 0 -and $result[-1]) { $focused = $true }
+        } catch { }
+    }
+    else {
+        try { $ps.Stop() } catch { }
+    }
+    try { $ps.Dispose() } catch { }
+    return $focused
 }
 
 function New-SendPayload {
@@ -566,25 +693,34 @@ function New-SendPayload {
     }
     $stage = Join-Path $env:TEMP ("{0}-stage-{1}" -f $script:CommandName, [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Force -Path $stage | Out-Null
-    foreach ($dir in $dirs) {
-        Copy-Item -LiteralPath $dir.FullName -Destination (Join-Path $stage $dir.Name) -Recurse -Force
+    $zip = Join-Path $env:TEMP ("{0}-{1}.zip" -f $script:CommandName, [guid]::NewGuid().ToString('N'))
+    $downloadName = if ($files.Count -eq 0 -and $dirs.Count -eq 1) {
+        "{0}.zip" -f $dirs[0].Name
+    } else {
+        "{0}-files-{1}.zip" -f $script:AppName, (Get-Date -Format 'yyyyMMdd-HHmmss')
     }
-    foreach ($file in $files) {
-        $dest = Join-Path $stage $file.Name
-        $n = 1
-        while (Test-Path -LiteralPath $dest) {
-            $dest = Join-Path $stage ("{0} ({1}){2}" -f $file.BaseName, $n, $file.Extension)
-            $n++
+    try {
+        foreach ($dir in $dirs) {
+            Copy-Item -LiteralPath $dir.FullName -Destination (Join-Path $stage $dir.Name) -Recurse -Force
         }
-        Copy-Item -LiteralPath $file.FullName -Destination $dest -Force
+        foreach ($file in $files) {
+            $dest = Join-Path $stage $file.Name
+            $n = 1
+            while (Test-Path -LiteralPath $dest) {
+                $dest = Join-Path $stage ("{0} ({1}){2}" -f $file.BaseName, $n, $file.Extension)
+                $n++
+            }
+            Copy-Item -LiteralPath $file.FullName -Destination $dest -Force
+        }
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        [IO.Compression.ZipFile]::CreateFromDirectory($stage, $zip)
     }
-    $zip = Join-Path $env:TEMP ("{0}-{1}.zip" -f $script:AppName, [guid]::NewGuid().ToString('N'))
-    Add-Type -AssemblyName System.IO.Compression.FileSystem
-    [IO.Compression.ZipFile]::CreateFromDirectory($stage, $zip)
-    Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+    finally {
+        Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+    }
     return @{
         Path = $zip
-        Name = "$($script:AppName).zip"
+        Name = $downloadName
         Temp = $zip
         Size = [long](Get-Item -LiteralPath $zip).Length
     }
@@ -821,7 +957,7 @@ function Start-ShareServer {
         }
         if (-not $Quiet) {
             Write-Host ''
-            if ($done) { Write-Host 'Download finished. You can close this window.' -ForegroundColor Green }
+            if ($done) { Write-Host 'Download finished. The other PC has the file.' -ForegroundColor Green }
             else { Write-Host 'Stopped before a download finished.' -ForegroundColor Yellow }
         }
     } finally {
@@ -846,8 +982,15 @@ function Show-SendFiles {
             Write-Host 'The Outbox is empty.' -ForegroundColor Yellow
             Write-Host ("Put files in {0}" -f (Get-OutboxPath))
             Write-Host ''
-            $open = Read-Host '[O] Open Outbox  [Q] Back'
-            if ($open -match '^[Oo]') { Open-Folder (Get-OutboxPath) }
+            $open = Read-Host '[O] Open Outbox  [R] Refresh  [Q] Back'
+            if ($open -match '^[Oo]') {
+                Open-Folder (Get-OutboxPath)
+                Write-Host ''
+                Write-Host 'Add files to Outbox, then press Enter to refresh.' -ForegroundColor DarkGray
+                [void](Read-Host)
+                continue
+            }
+            if ([string]::IsNullOrWhiteSpace($open) -or $open -match '^[Rr]') { continue }
             return
         }
         $selected = @{}
@@ -1203,45 +1346,7 @@ function Set-QuickReceiveFlag {
 }
 
 function Open-InboxFront {
-    $path = Get-InboxPath
-    if (-not (Test-Path -LiteralPath $path)) { New-Item -ItemType Directory -Path $path -Force | Out-Null }
-    $full = [IO.Path]::GetFullPath($path)
-    $ps = [PowerShell]::Create()
-    [void]$ps.AddScript({
-        param($Folder)
-        try {
-            $shell = New-Object -ComObject Shell.Application
-            foreach ($window in @($shell.Windows())) {
-                try { $location = [string]$window.Document.Folder.Self.Path } catch { continue }
-                if (-not $location) { continue }
-                try { $location = [IO.Path]::GetFullPath($location) } catch { continue }
-                if ($location -ine $Folder) { continue }
-                if (-not ('SlipWin.SlipWindow' -as [type])) {
-                    Add-Type -MemberDefinition '[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow); [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);' -Name SlipWindow -Namespace SlipWin | Out-Null
-                }
-                $hwnd = [IntPtr]$window.HWND
-                [void][SlipWin.SlipWindow]::ShowWindow($hwnd, 9)
-                [void][SlipWin.SlipWindow]::SetForegroundWindow($hwnd)
-                return $true
-            }
-        } catch { }
-        return $false
-    }).AddArgument($full)
-    $handle = $ps.BeginInvoke()
-    $focused = $false
-    if ($handle.AsyncWaitHandle.WaitOne(1500, $false)) {
-        try {
-            $result = @($ps.EndInvoke($handle))
-            if ($result.Count -gt 0 -and $result[-1]) { $focused = $true }
-        } catch { }
-    }
-    else {
-        try { $ps.Stop() } catch { }
-    }
-    try { $ps.Dispose() } catch { }
-    if (-not $focused) {
-        Start-Process -FilePath (Join-Path $env:WINDIR 'explorer.exe') -ArgumentList $full
-    }
+    Open-Folder (Get-InboxPath)
 }
 
 function Send-PresenceBeacon {
@@ -1257,7 +1362,7 @@ function Send-PresenceBeacon {
 }
 
 function Start-PresenceLoop {
-    $stopFile = Join-Path $env:TEMP ("slip-presence-{0}.stop" -f $PID)
+    $stopFile = Join-Path $env:TEMP ("{0}-presence-{1}.stop" -f $script:CommandName, $PID)
     if (Test-Path -LiteralPath $stopFile) { Remove-Item -LiteralPath $stopFile -Force }
     $ps = [PowerShell]::Create()
     [void]$ps.AddScript({
@@ -1300,8 +1405,9 @@ function Stop-PresenceLoop {
 }
 
 function Start-QuickReceiveTask {
-    $cmd = Join-Path (Get-SlipCommandDir) 'slip-listen.cmd'
-    $action = "schtasks /Create /TN `"Slip Quick Receive`" /SC ONLOGON /RL LIMITED /F /TR `"$cmd`""
+    $cmd = Join-Path (Get-SlipCommandDir) "$($script:CommandName)-listen.cmd"
+    $taskName = Get-QuickTaskName
+    $action = "schtasks /Create /TN `"$taskName`" /SC ONLOGON /RL LIMITED /F /TR `"$cmd`""
     cmd /c $action | Out-Null
 }
 
@@ -1318,19 +1424,27 @@ function Stop-QuickReceive {
         }
         Remove-Item -LiteralPath $pidPath -Force -ErrorAction SilentlyContinue
     }
-    cmd /c 'schtasks /Delete /TN "Slip Quick Receive" /F' | Out-Null
+    $taskName = Get-QuickTaskName
+    cmd /c "schtasks /Delete /TN `"$taskName`" /F" 2>$null | Out-Null
+}
+
+function Enable-QuickReceive {
+    param([switch]$Quiet)
+    Stop-QuickReceive
+    Set-QuickReceiveFlag $true
+    Install-SlipCommand
+    Start-QuickReceiveTask
+    $cmd = Join-Path (Get-SlipCommandDir) "$($script:CommandName)-listen.cmd"
+    Start-Process -FilePath $cmd -WindowStyle Hidden
+    if (-not $Quiet) {
+        Write-Host 'Quick receive is on. This PC can take a file with no PIN.' -ForegroundColor Green
+    }
 }
 
 function Set-QuickReceive {
     param([bool]$On)
     if ($On) {
-        Stop-QuickReceive
-        Set-QuickReceiveFlag $true
-        Install-SlipCommand
-        Start-QuickReceiveTask
-        $cmd = Join-Path (Get-SlipCommandDir) 'slip-listen.cmd'
-        Start-Process -FilePath $cmd -WindowStyle Hidden
-        Write-Host 'Quick receive is on. This PC can take a file with no PIN.' -ForegroundColor Green
+        Enable-QuickReceive
     }
     else {
         Set-QuickReceiveFlag $false
@@ -1363,7 +1477,9 @@ function Invoke-QuickUpload {
         $stream = $client.GetStream()
         $stream.ReadTimeout = 20000
         $stream.WriteTimeout = 20000
-        $header = "POST /quick HTTP/1.1`r`nHost: {0}`r`nContent-Length: {1}`r`nX-File-Name: {2}`r`nConnection: close`r`n`r`n" -f $Address, $file.Length, $DownloadName
+        $encodedName = [Uri]::EscapeDataString($DownloadName)
+        $encodedName64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($DownloadName))
+        $header = "POST /quick HTTP/1.1`r`nHost: {0}`r`nContent-Length: {1}`r`nX-File-Name: {2}`r`nX-File-Name64: {3}`r`nConnection: close`r`n`r`n" -f $Address, $file.Length, $encodedName, $encodedName64
         $headBytes = [Text.Encoding]::ASCII.GetBytes($header)
         $stream.Write($headBytes, 0, $headBytes.Length)
         $input = [IO.File]::OpenRead($file.FullName)
@@ -1418,16 +1534,16 @@ function Start-QuickListener {
     $port = ([Net.IPEndPoint]$listener.LocalEndpoint).Port
     try {
         while ((Get-Content -LiteralPath $flag -Raw -ErrorAction SilentlyContinue) -match 'on') {
-            $name = 'Slip'
+            $name = $script:AppName
             $nameFile = Join-Path $root 'name.txt'
             if (Test-Path -LiteralPath $nameFile) {
                 $stored = (Get-Content -LiteralPath $nameFile -Raw).Trim()
                 if ($stored) { $name = $stored }
             }
-            $payload = '{0}|QUICK|{1}|{2}|{3}|0|quick' -f 'SLIP1', $port, (ConvertTo-BeaconField $name), (ConvertTo-BeaconField $env:COMPUTERNAME)
+            $payload = '{0}|QUICK|{1}|{2}|{3}|0|quick' -f $script:BeaconPrefix, $port, (ConvertTo-BeaconField $name), (ConvertTo-BeaconField $env:COMPUTERNAME)
             $bytes = [Text.Encoding]::UTF8.GetBytes($payload)
             try {
-                $endpoint = New-Object System.Net.IPEndPoint ([Net.IPAddress]::Broadcast, 47654)
+                $endpoint = New-Object System.Net.IPEndPoint ([Net.IPAddress]::Broadcast, $script:BeaconPort)
                 [void]$udp.Send($bytes, $bytes.Length, $endpoint)
             }
             catch { }
@@ -1440,30 +1556,30 @@ function Start-QuickListener {
                 $stream = $client.GetStream()
                 $stream.ReadTimeout = 20000
                 $stream.WriteTimeout = 20000
-                $headerText = ''
-                $buffer = New-Object byte[] 1
-                while ($headerText -notmatch "`r`n`r`n" -and $headerText.Length -lt 8192) {
-                    $n = $stream.Read($buffer, 0, 1)
-                    if ($n -le 0) { break }
-                    $headerText += [Text.Encoding]::ASCII.GetString($buffer, 0, 1)
+                $headerText = Read-HttpHeaders $stream
+                if ($headerText -notmatch '^POST\s+/quick\s+HTTP/') {
+                    Send-HttpText $stream 404 'Not Found' 'text/plain' 'Not found'
+                    continue
                 }
-                if ($headerText -notmatch 'POST /quick') { continue }
                 $length = 0L
-                $fileName = 'slip-file.bin'
+                $fileName = "$($script:CommandName)-file.bin"
+                $fileName64 = $null
                 foreach ($line in ($headerText -split "`r`n")) {
                     if ($line -match '^Content-Length:\s*(\d+)') { $length = [int64]$Matches[1] }
                     if ($line -match '^X-File-Name:\s*(.+)$') { $fileName = $Matches[1].Trim() }
+                    if ($line -match '^X-File-Name64:\s*(.+)$') { $fileName64 = $Matches[1].Trim() }
+                }
+                if ($fileName64) {
+                    try { $fileName = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($fileName64)) } catch { }
+                }
+                elseif ($fileName) {
+                    try { $fileName = [Uri]::UnescapeDataString($fileName) } catch { }
                 }
                 $fileName = [IO.Path]::GetFileName($fileName)
-                if ([string]::IsNullOrWhiteSpace($fileName)) { $fileName = 'slip-file.bin' }
+                if ([string]::IsNullOrWhiteSpace($fileName)) { $fileName = "$($script:CommandName)-file.bin" }
                 $inbox = Join-Path $root 'Inbox'
                 if (-not (Test-Path -LiteralPath $inbox)) { New-Item -ItemType Directory -Path $inbox -Force | Out-Null }
-                $dest = Join-Path $inbox $fileName
-                if (Test-Path -LiteralPath $dest) {
-                    $stem = [IO.Path]::GetFileNameWithoutExtension($fileName)
-                    $ext = [IO.Path]::GetExtension($fileName)
-                    $dest = Join-Path $inbox ("{0}-{1}{2}" -f $stem, (Get-Date -Format 'yyyyMMdd-HHmmss'), $ext)
-                }
+                $dest = Get-UniqueFilePath -Directory $inbox -Name $fileName
                 $output = [IO.File]::Create($dest)
                 try {
                     $left = $length
@@ -1485,7 +1601,7 @@ function Start-QuickListener {
                 $okBytes = [Text.Encoding]::ASCII.GetBytes($ok)
                 $stream.Write($okBytes, 0, $okBytes.Length)
                 $stream.Flush()
-                Open-InboxFront
+                Open-ContainingFolder $dest
             }
             catch { }
             finally { $client.Close() }
@@ -1529,14 +1645,14 @@ function Show-CheckConnection {
     }
     $shares = @($best.Values)
     if ($shares.Count -eq 0) {
-        Write-Host 'No other PC is listed. The other PC needs Slip open, or Quick receive turned on.' -ForegroundColor Yellow
+        Write-Host "No other PC is listed. The other PC needs $($script:AppName) open, or Quick receive turned on." -ForegroundColor Yellow
     }
     foreach ($share in $shares) {
         $ping = Test-Icmp $share.IP
         Write-Host ''
         Write-Host ("{0} ({1})" -f $share.Display, $share.Windows) -ForegroundColor Cyan
         if ($share.Token -eq 'OPEN' -or $share.Port -le 0) {
-            Write-Host ("  {0}  ping {1}  Slip is open" -f $share.IP, (Format-Check $ping))
+            Write-Host ("  {0}  ping {1}  {2} is open" -f $share.IP, (Format-Check $ping), $script:AppName)
         }
         elseif ($share.Token -eq 'QUICK') {
             $tcp = Test-TcpOpen $share.IP $share.Port
@@ -1607,9 +1723,9 @@ function Save-RemoteFile {
         $inputStream = $resp.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
         $output = [IO.File]::Create($dest)
         $last = -1
+        $readTotal = 0L
         try {
             $buf = New-Object byte[] (1MB)
-            $readTotal = 0L
             while (($n = $inputStream.Read($buf, 0, $buf.Length)) -gt 0) {
                 $output.Write($buf, 0, $n)
                 $readTotal += $n
@@ -1626,6 +1742,10 @@ function Save-RemoteFile {
         } finally {
             $output.Dispose()
             $inputStream.Dispose()
+        }
+        if ($total -and $total -gt 0 -and $readTotal -lt [long]$total) {
+            Remove-Item -LiteralPath $dest -Force -ErrorAction SilentlyContinue
+            throw "Download stopped early after $(Format-ByteSize $readTotal) of $(Format-ByteSize ([long]$total))."
         }
         return $dest
     } finally {
@@ -1678,7 +1798,7 @@ function Show-ReceiveFiles {
             $saved = Save-RemoteFile -Url $url -Directory (Get-InboxPath)
             Write-Host ''
             Write-Host "Saved to $saved" -ForegroundColor Green
-            Open-InboxFront
+            Open-ContainingFolder $saved
             Wait-Enter
             return
         } catch {
@@ -1731,13 +1851,15 @@ function Show-SlipMenu {
                 'Send files',
                 'Receive files',
                 'Open Outbox',
+                'Open Inbox',
                 'More'
             ) -ZeroLabel $zero
             switch ($pick) {
                 0 { Show-SendFiles }
                 1 { Show-ReceiveFiles }
                 2 { Open-Folder (Get-OutboxPath) }
-                3 { Show-MoreMenu }
+                3 { Open-Folder (Get-InboxPath) }
+                4 { Show-MoreMenu }
                 default { return }
             }
         }
@@ -1860,6 +1982,9 @@ function Get-EntryOptions {
         Token = $null
         OutDir = $null
         ReadyFile = $null
+        DisplayName = $null
+        QuickReceive = $false
+        Quiet = $false
         Paths = @()
     }
     if ($env:SLIP_ENTRY) { $o.Entry = $env:SLIP_ENTRY }
@@ -1874,12 +1999,16 @@ function Get-EntryOptions {
         elseif ($token -eq 'serve') { $o.Entry = 'serve' }
         elseif ($token -eq 'recv') { $o.Entry = 'recv' }
         elseif ($token -eq 'listen') { $o.Entry = 'listen' }
+        elseif ($token -eq 'install' -or $token -eq 'setup') { $o.Entry = 'install' }
         elseif ($token -eq '-Address' -and ($i + 1) -lt $pending.Count) { $i++; $o.Address = [string]$pending[$i] }
         elseif ($token -eq '-Port' -and ($i + 1) -lt $pending.Count) { $i++; $o.Port = [int]$pending[$i] }
         elseif ($token -eq '-Pin' -and ($i + 1) -lt $pending.Count) { $i++; $o.Pin = [string]$pending[$i] }
         elseif ($token -eq '-Token' -and ($i + 1) -lt $pending.Count) { $i++; $o.Token = [string]$pending[$i] }
         elseif ($token -eq '-OutDir' -and ($i + 1) -lt $pending.Count) { $i++; $o.OutDir = [string]$pending[$i] }
         elseif ($token -eq '-ReadyFile' -and ($i + 1) -lt $pending.Count) { $i++; $o.ReadyFile = [string]$pending[$i] }
+        elseif ($token -eq '-DisplayName' -and ($i + 1) -lt $pending.Count) { $i++; $o.DisplayName = [string]$pending[$i] }
+        elseif ($token -eq '-QuickReceive' -or $token -eq '-EnableQuickReceive' -or $token -eq '-AutoReceive') { $o.QuickReceive = $true }
+        elseif ($token -eq '-Quiet' -or $token -eq '-Silent' -or $token -eq '/quiet' -or $token -eq '/silent') { $o.Quiet = $true }
         elseif ($token -like '-*') { }
         else { $paths += $token }
         $i++
@@ -1895,6 +2024,20 @@ function Exit-Slip {
 
 $script:Opt = Get-EntryOptions
 switch ($script:Opt.Entry) {
+    'install' {
+        try {
+            if (Invoke-UnattendedInstall -DisplayName $script:Opt.DisplayName -QuickReceive:$script:Opt.QuickReceive -Quiet:$script:Opt.Quiet) {
+                Exit-Slip 0
+            } else {
+                Exit-Slip 1
+            }
+        } catch {
+            if (-not $script:Opt.Quiet) {
+                [Console]::Error.WriteLine($_.Exception.Message)
+            }
+            Exit-Slip 1
+        }
+    }
     'firewall' {
         try {
             Install-FirewallRules
