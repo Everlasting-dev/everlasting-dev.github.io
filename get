@@ -12,7 +12,7 @@ $script:RawArgs = @($args)
 $script:RuleTcp = "$($script:AppName) TCP"
 $script:RuleUdp = "$($script:AppName) Discovery"
 $script:BeaconPrefix = $script:AppName.ToUpperInvariant() + '1'
-$script:Version = '0.0.2'
+$script:Version = '0.0.3'
 
 function Initialize-SlipSecurityProtocol {
     try {
@@ -4008,19 +4008,35 @@ switch ($script:Opt.Entry) {
         }
     }
     'chatjoin' {
+        $from = ''
         try {
-            $from = ''
             $text = ''
             if ($script:Opt.PeerName) { $from = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($script:Opt.PeerName)) }
             if ($script:Opt.OpeningB64) { $text = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($script:Opt.OpeningB64)) }
             $client = New-Object System.Net.Sockets.TcpClient
             $wait = $client.BeginConnect($script:Opt.Address, [int]$script:Opt.Port, $null, $null)
-            if (-not $wait.AsyncWaitHandle.WaitOne(5000, $false)) { throw 'chat closed' }
+            if (-not $wait.AsyncWaitHandle.WaitOne(5000, $false)) { throw ("timed out connecting to {0}:{1}" -f $script:Opt.Address, $script:Opt.Port) }
             $client.EndConnect($wait)
             Show-ChatSession -Room $script:Opt.Room -Title $from -Stream $client.GetStream() -Client $client -OpeningFrom $from -OpeningText $text
             Exit-Slip 0
         } catch {
-            Write-Host 'chat closed' -ForegroundColor DarkGray
+            # The guest dials back out to the PC that started the chat. If that
+            # fails, say why and stay open instead of flashing the window shut.
+            Clear-Host
+            Write-Host 'Chat' -ForegroundColor Cyan
+            Write-Host ''
+            $who = if ($from) { "$from's PC" } else { 'the other PC' }
+            Write-Host ("Could not join {0}." -f $who) -ForegroundColor Yellow
+            Write-Host ("Tried to connect back to {0}:{1}." -f $script:Opt.Address, $script:Opt.Port) -ForegroundColor DarkGray
+            Write-Host ''
+            Write-Host 'That PC started the chat, but this PC could not connect back to it.'
+            Write-Host 'Usually that PC is on a Public network, or its firewall is blocking the chat port.'
+            Write-Host 'On that PC: Slip > More > Diagnostics > Check and fix, and set the network to Private.' -ForegroundColor DarkGray
+            Write-Host ''
+            Write-Host ("Detail: {0}" -f $_.Exception.Message) -ForegroundColor DarkGray
+            Write-Host ''
+            Write-Host 'Press Enter to close this window.' -ForegroundColor DarkGray
+            [void](Read-Host)
             Exit-Slip 1
         }
     }

@@ -3,6 +3,13 @@
 Internal handoff log for Cursor agents and plugins. Newest entries first.
 Read before editing; append after substantive changes.
 
+## 2026-09-30 - publish Slip 0.0.3
+
+- **Why:** a chat window that failed to connect back closed immediately, so the reason was unreadable
+- **Changes:** replaced `get` with version 0.0.3. A failed `chatjoin` stays open, names the address and port, and waits for Enter.
+- **Files:** `get`, `AGENT_CHANGELOG.md`
+- **Notes:** Diagnostics → Check and fix downloads this file. The PC that starts the chat must be on a Private network.
+
 ## 2026-09-30 - publish Slip 0.0.2
 
 - **Why:** chat messages after the first one waited until the other person pressed Enter
