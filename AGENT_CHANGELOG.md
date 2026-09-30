@@ -3,6 +3,12 @@
 Internal handoff log for Cursor agents and plugins. Newest entries first.
 Read before editing; append after substantive changes.
 
+## 2026-09-30 - slip command bypasses the script block
+
+- **Why:** PowerShell was opening `slip.ps1` from PATH and stopping because scripts are disabled
+- **Changes:** replaced `get` with version 1.3.3. The command is `slip.cmd` with `-ExecutionPolicy Bypass`. The script file is `slip-host.ps1`, so the name `slip` no longer matches a script.
+- **Files:** `get`, `AGENT_CHANGELOG.md`
+
 ## 2026-09-30 - installed Slip must download once for chat
 
 - **Why:** an older `slip upgrade` reruns the local script and never fetches Chat

@@ -12,7 +12,7 @@ $script:RawArgs = @($args)
 $script:RuleTcp = "$($script:AppName) TCP"
 $script:RuleUdp = "$($script:AppName) Discovery"
 $script:BeaconPrefix = $script:AppName.ToUpperInvariant() + '1'
-$script:Version = '1.3.2'
+$script:Version = '1.3.3'
 
 function Initialize-SlipSecurityProtocol {
     try {
@@ -338,7 +338,7 @@ function Get-SlipFunctionBlock {
 function $($script:CommandName) {
     `$local = '$installedScript'
     `$cmd = if (`$args.Count -gt 0) { [string]`$args[0] } else { '' }
-    if (`$cmd -match '^(?i:upgrade|update|migrate)$') {
+    if (`$cmd -match '^(?i:upgrade|update|migrate)`$') {
         `$tmp = Join-Path `$env:TEMP '$($script:CommandName)-upgrade.ps1'
         Remove-Item -LiteralPath `$tmp -Force -ErrorAction SilentlyContinue
         try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
@@ -407,8 +407,13 @@ function Set-ProfileBlock {
 function Get-SlipCommandDir {
     Join-Path $env:LOCALAPPDATA $script:AppName
 }
+function Get-SlipShimDir {
+    Join-Path (Get-SlipCommandDir) 'bin'
+}
 function Get-InstalledScriptPath {
-    Join-Path (Get-SlipCommandDir) "$($script:CommandName).ps1"
+    # Not named slip.ps1. PowerShell resolves a PATH command to a .ps1 of the
+    # same name before slip.cmd, then refuses to run it when scripts are disabled.
+    Join-Path (Get-SlipCommandDir) "$($script:CommandName)-host.ps1"
 }
 
 function Update-InstalledSlipScript {
@@ -457,19 +462,30 @@ set SLIP_FETCHED_UPGRADE=
 del /f /q "%TEMP%\slip-upgrade.ps1" >nul 2>&1
 exit /b %SLIP_ERR%
 "@
+    $legacyScript = Join-Path $dir "$($script:CommandName).ps1"
+    if ((Test-Path -LiteralPath $legacyScript) -and ($legacyScript -ine $installedScript)) {
+        Remove-Item -LiteralPath $legacyScript -Force -ErrorAction SilentlyContinue
+    }
+    Unblock-File -LiteralPath $installedScript -ErrorAction SilentlyContinue
+    $shim = Get-SlipShimDir
+    if (-not (Test-Path -LiteralPath $shim)) {
+        New-Item -ItemType Directory -Force -Path $shim | Out-Null
+    }
     Set-Content -LiteralPath (Join-Path $dir "$($script:CommandName).cmd") -Value $menuCmd -Encoding ASCII
+    Set-Content -LiteralPath (Join-Path $shim "$($script:CommandName).cmd") -Value $menuCmd -Encoding ASCII
     Remove-Item -LiteralPath (Join-Path $dir "$($script:CommandName)-listen.cmd") -Force -ErrorAction SilentlyContinue
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
     if (-not $userPath) { $userPath = '' }
-    $parts = @($userPath -split ';' | Where-Object { $_ -and ($_.TrimEnd('\') -ine $dir.TrimEnd('\')) })
-    $parts += $dir
+    $drop = @($dir.TrimEnd('\').ToLowerInvariant(), $shim.TrimEnd('\').ToLowerInvariant())
+    $parts = @($userPath -split ';' | Where-Object { $_ -and ($drop -notcontains $_.Trim().TrimEnd('\').ToLowerInvariant()) })
+    $parts += $shim
     [Environment]::SetEnvironmentVariable('Path', ($parts -join ';'), 'User')
     Send-EnvironmentChanged
-    if ($env:Path -notlike "*$dir*") { $env:Path = "$dir;$env:Path" }
+    if ($env:Path -notlike "*$shim*") { $env:Path = "$shim;$env:Path" }
     $invoke = @"
 function global:$($script:CommandName) {
     `$cmd = if (`$args.Count -gt 0) { [string]`$args[0] } else { '' }
-    if (`$cmd -match '^(?i:upgrade|update|migrate)$') {
+    if (`$cmd -match '^(?i:upgrade|update|migrate)`$') {
         `$tmp = Join-Path `$env:TEMP 'slip-upgrade.ps1'
         Remove-Item -LiteralPath `$tmp -Force -ErrorAction SilentlyContinue
         try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
@@ -494,13 +510,17 @@ function global:$($script:CommandName) {
 
 function Remove-SlipCommand {
     $dir = Get-SlipCommandDir
-    foreach ($name in @("$($script:CommandName).cmd", "$($script:CommandName)-listen.cmd", "$($script:CommandName).ps1")) {
+    $shim = Get-SlipShimDir
+    foreach ($name in @("$($script:CommandName).cmd", "$($script:CommandName)-listen.cmd", "$($script:CommandName).ps1", "$($script:CommandName)-host.ps1")) {
         $path = Join-Path $dir $name
         if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
     }
+    $shimCmd = Join-Path $shim "$($script:CommandName).cmd"
+    if (Test-Path -LiteralPath $shimCmd) { Remove-Item -LiteralPath $shimCmd -Force -ErrorAction SilentlyContinue }
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
     if ($userPath) {
-        $parts = @($userPath -split ';' | Where-Object { $_ -and ($_.TrimEnd('\') -ine $dir.TrimEnd('\')) })
+        $drop = @($dir.TrimEnd('\').ToLowerInvariant(), $shim.TrimEnd('\').ToLowerInvariant())
+        $parts = @($userPath -split ';' | Where-Object { $_ -and ($drop -notcontains $_.Trim().TrimEnd('\').ToLowerInvariant()) })
         [Environment]::SetEnvironmentVariable('Path', ($parts -join ';'), 'User')
         Send-EnvironmentChanged
     }
@@ -689,6 +709,7 @@ function Invoke-UnattendedUpgrade {
         Write-Host "Command: $($script:CommandName)"
         Write-Host 'Auto chat: on'
         if ($quickShouldRun) { Write-Host 'Quick receive: on' } else { Write-Host 'Quick receive: off' }
+        Write-Host "Type $($script:CommandName) again in this window."
         if (-not $ok) {
             Write-Host 'The new Slip is in place. The firewall prompt still needs a Yes before other PCs can connect.' -ForegroundColor Yellow
         }
@@ -833,9 +854,7 @@ function Show-RepairScreen {
             Stop-AutoChat
         }
         Write-Host 'Repair finished. Your Outbox and Inbox files are still there.' -ForegroundColor Green
-        Write-Host "New Command Prompt and PowerShell windows can type: $($script:CommandName)" -ForegroundColor Green
-        Write-Host ("Already-open windows can run: {0}" -f (Join-Path (Get-SlipCommandDir) "$($script:CommandName).cmd")) -ForegroundColor DarkGray
-        Write-Host 'Close and reopen an older window before typing the short command there.' -ForegroundColor DarkGray
+        Write-Host "Type $($script:CommandName) in this window. It runs even when Windows is set to block scripts." -ForegroundColor Green
     }
     Wait-Enter
 }
