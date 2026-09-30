@@ -2752,8 +2752,8 @@ function Enable-AutoChat {
     }
     if (-not $alive) {
         $arg = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`" chatlisten"
-        Start-Process -FilePath powershell.exe -ArgumentList $arg -WindowStyle Hidden | Out-Null
-        Write-TransferDebug 'chat.auto.started' @{ pid = 'new'; script = $scriptPath }
+        $proc = Start-Process -FilePath powershell.exe -ArgumentList $arg -WindowStyle Hidden -PassThru
+        Write-TransferDebug 'chat.auto.started' @{ pid = $proc.Id; script = $scriptPath }
     } else {
         Write-TransferDebug 'chat.auto.alive' @{ pid = $chatPid; script = $scriptPath }
     }
