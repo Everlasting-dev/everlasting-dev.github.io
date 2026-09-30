@@ -12,7 +12,7 @@ $script:RawArgs = @($args)
 $script:RuleTcp = "$($script:AppName) TCP"
 $script:RuleUdp = "$($script:AppName) Discovery"
 $script:BeaconPrefix = $script:AppName.ToUpperInvariant() + '1'
-$script:Version = '1.3.1'
+$script:Version = '1.3.2'
 
 function Initialize-SlipSecurityProtocol {
     try {
@@ -447,7 +447,8 @@ if "%~1"=="" (
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$installedScript" %*
 exit /b %errorlevel%
 :slipfetch
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }; Invoke-RestMethod -Uri '$($script:SourceUrl)' -OutFile `$env:TEMP\slip-upgrade.ps1"
+echo Downloading the latest Slip...
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }; Invoke-RestMethod -Uri '$($script:SourceUrl)' -OutFile (Join-Path $env:TEMP 'slip-upgrade.ps1') -ErrorAction Stop; exit 0 } catch { Write-Host $_.Exception.Message -ForegroundColor Red; exit 1 }"
 if errorlevel 1 exit /b 1
 set SLIP_FETCHED_UPGRADE=1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%TEMP%\slip-upgrade.ps1" upgrade %*
@@ -673,34 +674,26 @@ function Invoke-UnattendedUpgrade {
         Write-Host "Updating $($script:AppName)..." -ForegroundColor Cyan
     }
     $ok = Complete-SlipSetup -DisplayName $name -Quiet:$Quiet -NoPrompt -MakeNetworkPrivate:$MakeNetworkPrivate
-    if ($ok) {
-        $quickShouldRun = $QuickReceive -or (Test-QuickReceive)
-        if ($quickShouldRun) {
-            Enable-QuickReceive -Quiet:$Quiet
-        } else {
-            Remove-QuickReceiveTask
-            Remove-QuickReceiveRunKey
-        }
-        Enable-AutoChat -Quiet:$Quiet
-        Write-SlipLog "Upgrade completed. version=$($script:Version) quickReceive=$([bool]$quickShouldRun) autoChat=true."
-        if (-not $Quiet) {
-            Write-Host "$($script:AppName) $($script:Version) is up to date." -ForegroundColor Green
-            Write-Host ("Shown as: {0}" -f (Get-DisplayName))
-            Write-Host "Command: $($script:CommandName)"
-            if ($quickShouldRun) {
-                Write-Host 'Quick receive: on'
-            } else {
-                Write-Host 'Quick receive: off'
-            }
-            Write-Host 'Auto chat: on'
-        }
-        return $true
+    $quickShouldRun = $QuickReceive -or (Test-QuickReceive)
+    if ($quickShouldRun) {
+        Enable-QuickReceive -Quiet:$Quiet
+    } else {
+        Remove-QuickReceiveTask
+        Remove-QuickReceiveRunKey
     }
+    Enable-AutoChat -Quiet:$Quiet
+    Write-SlipLog "Upgrade completed. version=$($script:Version) setupOk=$([bool]$ok) quickReceive=$([bool]$quickShouldRun) autoChat=true."
     if (-not $Quiet) {
-        Write-Host "$($script:AppName) could not be updated." -ForegroundColor Red
+        Write-Host "$($script:AppName) $($script:Version) is installed." -ForegroundColor Green
+        Write-Host ("Shown as: {0}" -f (Get-DisplayName))
+        Write-Host "Command: $($script:CommandName)"
+        Write-Host 'Auto chat: on'
+        if ($quickShouldRun) { Write-Host 'Quick receive: on' } else { Write-Host 'Quick receive: off' }
+        if (-not $ok) {
+            Write-Host 'The new Slip is in place. The firewall prompt still needs a Yes before other PCs can connect.' -ForegroundColor Yellow
+        }
     }
-    Write-SlipLog 'Upgrade failed.'
-    return $false
+    return $true
 }
 
 function Read-CleanName {

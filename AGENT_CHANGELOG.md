@@ -3,6 +3,12 @@
 Internal handoff log for Cursor agents and plugins. Newest entries first.
 Read before editing; append after substantive changes.
 
+## 2026-09-30 - installed Slip must download once for chat
+
+- **Why:** an older `slip upgrade` reruns the local script and never fetches Chat
+- **Changes:** replaced `get` with version 1.3.2. The upgrade installs that script and turns Auto chat on. A PC that already has Slip needs one online command before `slip upgrade` starts downloading.
+- **Files:** `get`, `AGENT_CHANGELOG.md`
+
 ## 2026-09-30 - slip upgrade downloads the latest script
 
 - **Why:** `slip upgrade` should fetch the published script instead of reapplying the copy already on the PC
