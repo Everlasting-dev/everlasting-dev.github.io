@@ -3,6 +3,13 @@
 Internal handoff log for Cursor agents and plugins. Newest entries first.
 Read before editing; append after substantive changes.
 
+## 2026-09-30 - publish Slip 0.0.2
+
+- **Why:** chat messages after the first one waited until the other person pressed Enter
+- **Changes:** replaced `get` with version 0.0.2. Chat input uses `[Console]::KeyAvailable` and `[Console]::ReadKey` so the socket keeps being read while the window is idle.
+- **Files:** `get`, `AGENT_CHANGELOG.md`
+- **Notes:** Both PCs need 0.0.2. Diagnostics → Check and fix downloads this file. If a chat still stalls, `chat.session.input` in the debug log says which input mode that window used.
+
 ## 2026-09-30 - publish Slip 0.0.1
 
 - **Why:** other PCs were still downloading 1.3.5, so they could not get the separate chat window

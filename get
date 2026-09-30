@@ -12,7 +12,7 @@ $script:RawArgs = @($args)
 $script:RuleTcp = "$($script:AppName) TCP"
 $script:RuleUdp = "$($script:AppName) Discovery"
 $script:BeaconPrefix = $script:AppName.ToUpperInvariant() + '1'
-$script:Version = '0.0.1'
+$script:Version = '0.0.2'
 
 function Initialize-SlipSecurityProtocol {
     try {
@@ -2946,6 +2946,28 @@ function Start-ChatListener {
     }
 }
 
+function Test-ChatConsoleKeys {
+    # The chat's live input relies on the .NET Console key API, which is reliable
+    # under both classic conhost and Windows Terminal / ConPTY. $Host.UI.RawUI's
+    # KeyAvailable is not: under ConPTY it can report a key when there is none, so
+    # ReadKey then blocks and the socket stops being polled - which looked like
+    # "messages only appear after I press Enter".
+    try { $null = [Console]::KeyAvailable; return $true } catch { return $false }
+}
+
+function Read-ChatKey {
+    $ck = [Console]::ReadKey($true)
+    $name = ''
+    switch ($ck.Key) {
+        'Enter'     { $name = 'Enter' }
+        'Escape'    { $name = 'Escape' }
+        'Backspace' { $name = 'Backspace' }
+    }
+    $char = ''
+    if ($ck.KeyChar -and ([int][char]$ck.KeyChar) -ge 32) { $char = [string]$ck.KeyChar }
+    return @{ Name = $name; Char = $char }
+}
+
 function Show-ChatSession {
     param(
         [string]$Room,
@@ -2961,7 +2983,8 @@ function Show-ChatSession {
     $members = @()
     $closed = $false
     $draft = ''
-    $rawInput = Test-SlipConsoleKeys
+    $rawInput = Test-ChatConsoleKeys
+    Write-TransferDebug 'chat.session.input' @{ mode = $(if ($rawInput) { 'console-keys' } else { 'read-host' }); host = $Host.Name }
     Clear-Host
     Write-Host 'Chat' -ForegroundColor Cyan
     Write-Host ("Version {0}    {1}" -f $script:Version, $Title) -ForegroundColor DarkGray
@@ -3097,19 +3120,21 @@ function Show-ChatSession {
             }
             continue
         }
-        if (-not $Host.UI.RawUI.KeyAvailable) {
-            Start-Sleep -Milliseconds 8
+        $hasKey = $false
+        try { $hasKey = [Console]::KeyAvailable } catch { $hasKey = $false }
+        if (-not $hasKey) {
+            Start-Sleep -Milliseconds 10
             continue
         }
-        $key = Read-SlipKey
+        $key = Read-ChatKey
         if ($key.Name -eq 'Escape') {
             $peersHere = if ($IsHost) { @($members).Count -gt 0 } else { ($Client -and -not (Test-SocketDead $Client)) }
             if (-not $peersHere) { $closed = $true; break }
             Clear-ChatInput
             Write-Host ''
             Write-Host 'Leave the chat? The other PC is still connected.  [Y] Leave   [N] Stay' -ForegroundColor Yellow
-            $ans = Read-SlipKey
-            while ($ans.Name -ne 'Enter' -and $ans.Name -ne 'Escape' -and ($ans.Char -notmatch '^[YyNn]$')) { $ans = Read-SlipKey }
+            $ans = Read-ChatKey
+            while ($ans.Name -ne 'Enter' -and $ans.Name -ne 'Escape' -and ($ans.Char -notmatch '^[YyNn]$')) { $ans = Read-ChatKey }
             if ($ans.Char -match '^[Yy]$' -or $ans.Name -eq 'Escape') { $closed = $true; break }
             Write-Host 'Still in the chat.' -ForegroundColor DarkGray
             Show-ChatInput
