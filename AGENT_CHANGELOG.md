@@ -3,35 +3,90 @@
 Internal handoff log for Cursor agents and plugins. Newest entries first.
 Read before editing; append after substantive changes.
 
-## 2026-09-30 - slip command bypasses the script block
+## 2026-09-30 - Slip 1.3.4 upgrade and chat polish
 
-- **Why:** PowerShell was opening `slip.ps1` from PATH and stopping because scripts are disabled
-- **Changes:** replaced `get` with version 1.3.3. The command is `slip.cmd` with `-ExecutionPolicy Bypass`. The script file is `slip-host.ps1`, so the name `slip` no longer matches a script.
-- **Files:** `get`, `AGENT_CHANGELOG.md`
+- **Why:** The old upgrade wrappers could leave stale files behind, background listeners could hold the installed host script during upgrade, chat invites felt delayed, and chat failures were hard to diagnose from the debug folder.
+- **Changes:** Version 1.3.4. Profile and in-session `slip` wrappers now generate from literal templates, so the upgrade regex cannot be broken by PowerShell string expansion. Command Prompt `slip upgrade` downloads `get` and forwards only the intended arguments to the fetched script. Upgrade stops old Quick receive and Auto chat listeners before refreshing `slip-host.ps1`, skips copying when source and target hashes match, restarts Auto chat from the latest host script, preserves Quick receive unless `-QuickReceive` is passed, and removes old `slip.ps1`, listener wrappers, and temp upgrade files. Chat invite polling is faster and chat discovery/invite/session breadcrumbs now append to `Documents\Slip\Debug\transfer-debug.log`. Added `NETWORKING_WSL.md` for the 172.x virtual adapter issue.
+- **Files:** `lanfile.ps1`, `UI.md`, `upgrade-existing-slip.ps1`, `upgrade-existing-slip.cmd`, `NETWORKING_WSL.md`, `AGENT_CHANGELOG.md`
+- **Notes:** Republish `get`. After one fetched upgrade, old PCs should be able to use plain `slip upgrade` for later releases. Use `slip upgrade -QuickReceive -Quiet` when the receiver should be enabled as part of the upgrade.
 
-## 2026-09-30 - installed Slip must download once for chat
+## 2026-09-30 - slip works when scripts are disabled
 
-- **Why:** an older `slip upgrade` reruns the local script and never fetches Chat
-- **Changes:** replaced `get` with version 1.3.2. The upgrade installs that script and turns Auto chat on. A PC that already has Slip needs one online command before `slip upgrade` starts downloading.
-- **Files:** `get`, `AGENT_CHANGELOG.md`
+- **Why:** Typing `slip` in PowerShell on another PC failed with `running scripts is disabled` for `AppData\Local\Slip\slip.ps1`. PowerShell finds a `.ps1` on PATH before `slip.cmd` and then loads it under the normal script policy. The profile function written by 1.3.2 was also invalid: an expandable here-string ate `$'` in the upgrade regex, so the profile could not parse.
+- **Changes:** Version 1.3.3. The installed script is `AppData\Local\Slip\slip-host.ps1`. `slip.cmd` stays beside it for windows that already have that folder on PATH, and a second copy is in `AppData\Local\Slip\bin`, which is the PATH entry for new windows. Both launchers use `-ExecutionPolicy Bypass`. The old `slip.ps1` name is deleted on install so it cannot shadow the command. The profile regex is `` `(?i:upgrade|update|migrate)`$ `` inside the expandable here-string so the written file contains a closed quote. This PC's broken profile quote was repaired in place.
+- **Files:** `lanfile.ps1`, `UI.md`, `AGENT_CHANGELOG.md`, and this PC's `Documents\WindowsPowerShell\Microsoft.PowerShell_profile.ps1`
+- **Notes:** A PC that still has the old `slip` command does not get this until it runs the online updater once. Command Prompt:
+
+```bat
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$p=Join-Path $env:TEMP 'slip-upgrade.ps1'; try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }; Invoke-RestMethod https://everlasting-dev.github.io/get -OutFile $p -ErrorAction Stop; $env:SLIP_FETCHED_UPGRADE='1'; powershell -NoProfile -ExecutionPolicy Bypass -File $p upgrade; exit $LASTEXITCODE"
+```
+
+After that, type `slip` again. Expect version 1.3.3, Chat on the menu, and Auto chat on. Outbox, Inbox, and the display name stay. Quick receive stays as that PC left it. Do not put a file named `slip.ps1` on PATH. Do not write `$'` inside an expandable here-string; escape the dollar. Live file is `https://everlasting-dev.github.io/get`.
+
+## 2026-09-30 - old slip upgrade never downloaded chat
+
+- **Why:** `slip upgrade` on a PC installed before 1.3.1 runs that PC's local `slip.ps1`. The old command passes `menu upgrade` to the file already on disk, and that file copies itself onto itself, so Chat never arrives even though the live `get` file has it.
+- **Changes:** Version 1.3.2. A fetched upgrade still installs the new script and turns Auto chat on when the firewall prompt is dismissed. The Command Prompt downloader exits 1 if the download throws. An older PC needs one online command (in UI.md) before `slip upgrade` starts downloading on its own.
+- **Files:** `lanfile.ps1`, `UI.md`, `upgrade-existing-slip.ps1`, `AGENT_CHANGELOG.md`
+- **Notes:** Do not tell someone that typing `slip upgrade` on a pre-1.3.2 install will fetch Chat. They have to run the online command once.
 
 ## 2026-09-30 - slip upgrade downloads the latest script
 
-- **Why:** `slip upgrade` should fetch the published script instead of reapplying the copy already on the PC
-- **Changes:** replaced `get` with version 1.3.1. Command Prompt `slip upgrade` downloads this file and turns Auto chat on.
-- **Files:** `get`, `AGENT_CHANGELOG.md`
+- **Why:** `slip upgrade` in Command Prompt was reapplying the copy already on the PC, so chat and later fixes never arrived
+- **Changes:** `slip`, `slip upgrade`, `slip update`, and `slip migrate` in Command Prompt and PowerShell download `get` and run that file. The upgrade turns Auto chat on, keeps Quick receive as it was, and leaves Outbox, Inbox, and the display name in place. Version is 1.3.1.
+- **Files:** `lanfile.ps1`, `AGENT_CHANGELOG.md`
+- **Notes:** `slip` with no arguments still opens the menu. Republish `get`. Correction: a `slip.cmd` installed before 1.3.2 does not download. It reruns the local script. The 1.3.3 entry has the one command that replaces it.
 
-## 2026-09-30 - shorter menus, version 1.3.0, auto chat
+## 2026-09-30 - shorter menus, version, auto chat on
 
-- **Why:** the published `get` script should match the local Slip menu and the auto chat listener
-- **Changes:** replaced `get` with version 1.3.0. Main menu is Send, Receive, Chat, Folders, and More. Repair and Upgrade are under Diagnostics. Auto chat is on by default.
-- **Files:** `get`, `AGENT_CHANGELOG.md`
-- **Notes:** An already installed PC gets this by choosing Diagnostics, Upgrade.
+- **Why:** The More list had grown into everyday actions plus repair and logs, and chat needed to open on the other PC the way Quick receive accepts a file
+- **Changes:** Slip is version 1.3.0, shown on every menu. The main menu is Send, Receive, Chat, Folders, and More. Repair, Upgrade, Remove, Rename, Network, Debug, and the chat log sit under Diagnostics. Auto chat is on unless `Documents\Slip\chat.txt` says off. A chat invite opens a window, uses `joined`, `left`, and `chat closed`, and appends a DPAPI-encrypted log at `Documents\Slip\Chat\chat.log`.
+- **Files:** `lanfile.ps1`, `UI.md`, `AGENT_CHANGELOG.md`
+- **Notes:** Auto chat listens on 8787-8796 and beacons `CHAT`. Quick receive stays off until turned on. Republish `get` before other PCs can open a chat against this build.
+
+## 2026-09-29 - reach the real LAN, not WSL or a Public profile
+
+- **Why:** Send and receive failed on a PC with WSL 2 installed. Three separate
+  causes: the firewall rules are scoped to Private but Windows had tagged the
+  active WiFi Public, and a profile applies per interface, so neither rule was
+  ever in force; `Get-LanIPv4` returned every non-loopback address including
+  WSL's `vEthernet (WSL (Hyper-V firewall))` at 172.21.0.1, and returned it
+  first, so the Sending screen printed an unreachable URL and Status showed the
+  wrong LAN address; and every beacon went out through one unbound UdpClient to
+  255.255.255.255, which Windows routes to the single lowest-metric interface,
+  on this PC a Wi-Fi Direct stub at metric 25 rather than WiFi at 45.
+- **Changes:** Added a `$script:NetHelpers` scriptblock holding
+  `Test-VirtualAdapterAlias`, `Get-SubnetBroadcast`, `Get-LanAddressRows`,
+  `Get-BroadcastTargets`, and `Send-BeaconPayload`, dot-sourced both into the
+  script and into the presence-loop runspace so there is one copy. `Get-LanIPv4`
+  now drops virtual adapters and orders what is left by interface metric, with
+  `-IncludeVirtual` for the self-address checks in `Test-OwnAddress` and
+  `Show-SendFiles`. All four beacon senders now bind a socket to each real local
+  address and send a subnet-directed broadcast, so discovery no longer depends
+  on the routing table picking the right adapter. Added
+  `Get-ActiveNetworkProfiles`, `Get-PublicNetworkProfiles`,
+  `Set-ActiveNetworksPrivate`, `Invoke-MakeNetworkPrivate`, and a `netprivate`
+  elevated entry. `Show-NetworkWarning` now points at the fix, Install and
+  Repair offer it, Status gained `Network:` and a plain `Receiving:` verdict,
+  Check connection names the addresses it ignored, and More gained a Network row.
+  Unattended install and upgrade never prompt; they warn and carry on, and take
+  a new opt-in `-MakeNetworkPrivate` flag that does it in the same elevation
+  prompt as the firewall rules.
+- **Files:** `lanfile.ps1`, `UI.md`, `AGENT_CHANGELOG.md`
+- **Notes:** Firewall rules stay `-Profile Private` on purpose. Quick receive
+  takes a file with no PIN, so opening the ports on a Public network would make
+  an Inbox that any device on that subnet can write to. Verified on this PC: a
+  3 MB loopback `serve`/`recv` round trip matches by SHA256, the presence loop
+  and the Quick receive listener both beacon on the real LAN, and discovery
+  found six other PCs. Worth knowing when testing: this PC has two stray
+  `Windows PowerShell` inbound Allow rules on the Public profile for every port,
+  which is what made Slip appear to work here while the Slip rules were inert. A
+  clean PC will not have them. Republish `get`.
 
 ## 2026-09-29 - old PC rescue and Quick Receive diagnostics
 
 - **Why:** One upgraded PC still used an old PowerShell profile function that launched `slip.ps1` without `-ExecutionPolicy Bypass`, Repair hit the old self-copy bug, a pasted/repeated number crashed the send picker, and Quick Receive discovery needed a fallback when UDP beacons do not appear.
-- **Changes:** Documented the `-NoProfile` online updater as the rescue path for old profile functions, made the send file picker ignore oversized numeric input instead of throwing, added manual-IP Quick Receive sending with port scanning, and expanded Status to show Quick Receive state, registry startup, listener PID, and open port. The listener now writes `listen.port` beside `listen.pid`.
+- **Changes:** Documented the `-NoProfile` online updater as the rescue path for old profile functions, changed the PowerShell profile function to prefer the local installed `slip.ps1` with `-ExecutionPolicy Bypass`, made the send file picker ignore oversized numeric input instead of throwing, added manual-IP Quick Receive sending with port scanning, and expanded Status to show Quick Receive state, registry startup, listener PID, and open port. The listener now writes `listen.port` beside `listen.pid`.
 - **Files:** `lanfile.ps1`, `UI.md`, `AGENT_CHANGELOG.md`
 - **Notes:** If a receiving PC does not show up but Status says the listener is alive, senders can choose Type IP for Quick receive and enter the receiver's LAN address.
 

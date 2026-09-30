@@ -12,7 +12,7 @@ $script:RawArgs = @($args)
 $script:RuleTcp = "$($script:AppName) TCP"
 $script:RuleUdp = "$($script:AppName) Discovery"
 $script:BeaconPrefix = $script:AppName.ToUpperInvariant() + '1'
-$script:Version = '1.3.3'
+$script:Version = '1.3.4'
 
 function Initialize-SlipSecurityProtocol {
     try {
@@ -333,50 +333,55 @@ function Get-ProfilePaths {
 
 function Get-SlipFunctionBlock {
     $installedScript = Get-InstalledScriptPath
-@"
-# >>> $($script:CommandName) >>>
-function $($script:CommandName) {
-    `$local = '$installedScript'
-    `$cmd = if (`$args.Count -gt 0) { [string]`$args[0] } else { '' }
-    if (`$cmd -match '^(?i:upgrade|update|migrate)`$') {
-        `$tmp = Join-Path `$env:TEMP '$($script:CommandName)-upgrade.ps1'
-        Remove-Item -LiteralPath `$tmp -Force -ErrorAction SilentlyContinue
+    $template = @'
+# >>> __COMMAND__ >>>
+function __COMMAND__ {
+    $local = '__INSTALLED_SCRIPT__'
+    $cmd = if ($args.Count -gt 0) { [string]$args[0] } else { '' }
+    if ($cmd -match '^(?i:upgrade|update|migrate)$') {
+        $tmp = Join-Path $env:TEMP '__COMMAND__-upgrade.ps1'
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
         try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
-        Invoke-RestMethod -Uri '$($script:SourceUrl)' -OutFile `$tmp -ErrorAction Stop
-        `$env:SLIP_FETCHED_UPGRADE = '1'
+        Invoke-RestMethod -Uri '__SOURCE_URL__' -OutFile $tmp -ErrorAction Stop
+        $env:SLIP_FETCHED_UPGRADE = '1'
         try {
-            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File `$tmp upgrade @(`$args | Select-Object -Skip 1)
+            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $tmp upgrade @($args | Select-Object -Skip 1)
             return
         } finally {
             Remove-Item Env:SLIP_FETCHED_UPGRADE -ErrorAction SilentlyContinue
-            Remove-Item -LiteralPath `$tmp -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
         }
     }
-    if (Test-Path -LiteralPath `$local) {
-        if (`$args.Count -eq 0) {
-            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File `$local menu
+    if (Test-Path -LiteralPath $local) {
+        if ($args.Count -eq 0) {
+            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $local menu
         } else {
-            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File `$local @args
+            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $local @args
         }
         return
     }
-    `$tmp = Join-Path `$env:TEMP '$($script:CommandName)-get.ps1'
-    Remove-Item -LiteralPath `$tmp -Force -ErrorAction SilentlyContinue
+    $tmp = Join-Path $env:TEMP '__COMMAND__-get.ps1'
+    Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
     try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
-    Invoke-RestMethod -Uri '$($script:SourceUrl)' -OutFile `$tmp -ErrorAction Stop
-    if (-not (Test-Path -LiteralPath `$tmp)) { throw 'Could not download $($script:AppName).' }
+    Invoke-RestMethod -Uri '__SOURCE_URL__' -OutFile $tmp -ErrorAction Stop
+    if (-not (Test-Path -LiteralPath $tmp)) { throw 'Could not download __APP_NAME__.' }
     try {
-        if (`$args.Count -eq 0) {
-            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File `$tmp menu
+        if ($args.Count -eq 0) {
+            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $tmp menu
         } else {
-            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File `$tmp @args
+            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $tmp @args
         }
     } finally {
-        Remove-Item -LiteralPath `$tmp -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
     }
 }
-# <<< $($script:CommandName) <<<
-"@
+# <<< __COMMAND__ <<<
+'@
+    $block = $template.Replace('__COMMAND__', $script:CommandName)
+    $block = $block.Replace('__INSTALLED_SCRIPT__', ($installedScript -replace "'", "''"))
+    $block = $block.Replace('__SOURCE_URL__', ($script:SourceUrl -replace "'", "''"))
+    $block = $block.Replace('__APP_NAME__', ($script:AppName -replace "'", "''"))
+    return $block
 }
 
 function Set-ProfileBlock {
@@ -400,6 +405,13 @@ function Set-ProfileBlock {
             $updated = $prefix + $block
         }
         [IO.File]::WriteAllText($path, $updated)
+        $profileMarker = '$cmd -match ''^(?i:upgrade|update|migrate)$'''
+        try {
+            $check = [IO.File]::ReadAllText($path)
+            if ($check -notlike "*$profileMarker*") {
+                [IO.File]::WriteAllText($path, $block)
+            }
+        } catch { }
     }
     Install-SlipCommand
 }
@@ -416,6 +428,30 @@ function Get-InstalledScriptPath {
     Join-Path (Get-SlipCommandDir) "$($script:CommandName)-host.ps1"
 }
 
+function Remove-LegacySlipArtifacts {
+    $dir = Get-SlipCommandDir
+    $current = ''
+    if ($PSCommandPath) {
+        try { $current = [IO.Path]::GetFullPath($PSCommandPath) } catch { $current = $PSCommandPath }
+    }
+    $candidates = @(
+        (Join-Path $dir "$($script:CommandName).ps1"),
+        (Join-Path $dir "$($script:CommandName)-listen.cmd"),
+        (Join-Path $env:TEMP "$($script:CommandName)-get.ps1"),
+        (Join-Path $env:TEMP "$($script:CommandName)-upgrade.ps1"),
+        (Join-Path $env:TEMP "$($script:CommandName)-admin.ps1"),
+        (Join-Path $env:TEMP 'slip-get.ps1'),
+        (Join-Path $env:TEMP 'slip-upgrade.ps1')
+    )
+    foreach ($path in @($candidates | Select-Object -Unique)) {
+        if (-not (Test-Path -LiteralPath $path)) { continue }
+        $full = $path
+        try { $full = [IO.Path]::GetFullPath($path) } catch { }
+        if ($current -and ($full -ieq $current)) { continue }
+        Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Update-InstalledSlipScript {
     $target = Get-InstalledScriptPath
     $dir = Split-Path -Parent $target
@@ -426,6 +462,17 @@ function Update-InstalledSlipScript {
         $sourcePath = [IO.Path]::GetFullPath($PSCommandPath)
         $targetPath = [IO.Path]::GetFullPath($target)
         if ($sourcePath -ieq $targetPath) { return }
+        if (Test-Path -LiteralPath $target) {
+            try {
+                $sourceItem = Get-Item -LiteralPath $sourcePath -ErrorAction Stop
+                $targetItem = Get-Item -LiteralPath $targetPath -ErrorAction Stop
+                if ($sourceItem.Length -eq $targetItem.Length) {
+                    $sourceHash = (Get-FileHash -LiteralPath $sourcePath -Algorithm SHA256 -ErrorAction Stop).Hash
+                    $targetHash = (Get-FileHash -LiteralPath $targetPath -Algorithm SHA256 -ErrorAction Stop).Hash
+                    if ($sourceHash -eq $targetHash) { return }
+                }
+            } catch { }
+        }
         Copy-Item -LiteralPath $PSCommandPath -Destination $target -Force
         return
     }
@@ -439,29 +486,30 @@ function Install-SlipCommand {
     }
     Update-InstalledSlipScript
     $installedScript = Get-InstalledScriptPath
-    $menuCmd = @"
+    $menuTemplate = @'
 @echo off
 setlocal
 if /I "%~1"=="upgrade" goto slipfetch
 if /I "%~1"=="update" goto slipfetch
 if /I "%~1"=="migrate" goto slipfetch
 if "%~1"=="" (
-    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$installedScript" menu
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "__INSTALLED_SCRIPT__" menu
     exit /b %errorlevel%
 )
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$installedScript" %*
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "__INSTALLED_SCRIPT__" %*
 exit /b %errorlevel%
 :slipfetch
 echo Downloading the latest Slip...
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }; Invoke-RestMethod -Uri '$($script:SourceUrl)' -OutFile (Join-Path $env:TEMP 'slip-upgrade.ps1') -ErrorAction Stop; exit 0 } catch { Write-Host $_.Exception.Message -ForegroundColor Red; exit 1 }"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }; try { Invoke-RestMethod -Uri '__SOURCE_URL__' -OutFile (Join-Path $env:TEMP 'slip-upgrade.ps1') -ErrorAction Stop; exit 0 } catch { Write-Host $_.Exception.Message -ForegroundColor Red; exit 1 }"
 if errorlevel 1 exit /b 1
 set SLIP_FETCHED_UPGRADE=1
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%TEMP%\slip-upgrade.ps1" upgrade %*
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%TEMP%\slip-upgrade.ps1" %*
 set SLIP_ERR=%ERRORLEVEL%
 set SLIP_FETCHED_UPGRADE=
 del /f /q "%TEMP%\slip-upgrade.ps1" >nul 2>&1
 exit /b %SLIP_ERR%
-"@
+'@
+    $menuCmd = $menuTemplate.Replace('__INSTALLED_SCRIPT__', $installedScript).Replace('__SOURCE_URL__', $script:SourceUrl)
     $legacyScript = Join-Path $dir "$($script:CommandName).ps1"
     if ((Test-Path -LiteralPath $legacyScript) -and ($legacyScript -ine $installedScript)) {
         Remove-Item -LiteralPath $legacyScript -Force -ErrorAction SilentlyContinue
@@ -482,30 +530,32 @@ exit /b %SLIP_ERR%
     [Environment]::SetEnvironmentVariable('Path', ($parts -join ';'), 'User')
     Send-EnvironmentChanged
     if ($env:Path -notlike "*$shim*") { $env:Path = "$shim;$env:Path" }
-    $invoke = @"
-function global:$($script:CommandName) {
-    `$cmd = if (`$args.Count -gt 0) { [string]`$args[0] } else { '' }
-    if (`$cmd -match '^(?i:upgrade|update|migrate)`$') {
-        `$tmp = Join-Path `$env:TEMP 'slip-upgrade.ps1'
-        Remove-Item -LiteralPath `$tmp -Force -ErrorAction SilentlyContinue
+    $invokeTemplate = @'
+function global:__COMMAND__ {
+    $cmd = if ($args.Count -gt 0) { [string]$args[0] } else { '' }
+    if ($cmd -match '^(?i:upgrade|update|migrate)$') {
+        $tmp = Join-Path $env:TEMP 'slip-upgrade.ps1'
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
         try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
-        Invoke-RestMethod -Uri '$($script:SourceUrl)' -OutFile `$tmp -ErrorAction Stop
-        `$env:SLIP_FETCHED_UPGRADE = '1'
-        try { & powershell.exe -NoProfile -ExecutionPolicy Bypass -File `$tmp upgrade @(`$args | Select-Object -Skip 1) }
+        Invoke-RestMethod -Uri '__SOURCE_URL__' -OutFile $tmp -ErrorAction Stop
+        $env:SLIP_FETCHED_UPGRADE = '1'
+        try { & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $tmp upgrade @($args | Select-Object -Skip 1) }
         finally {
             Remove-Item Env:SLIP_FETCHED_UPGRADE -ErrorAction SilentlyContinue
-            Remove-Item -LiteralPath `$tmp -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
         }
         return
     }
-    if (`$args.Count -eq 0) {
-        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File '$installedScript' menu
+    if ($args.Count -eq 0) {
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File '__INSTALLED_SCRIPT__' menu
     } else {
-        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File '$installedScript' @args
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File '__INSTALLED_SCRIPT__' @args
     }
 }
-"@
+'@
+    $invoke = $invokeTemplate.Replace('__COMMAND__', $script:CommandName).Replace('__SOURCE_URL__', ($script:SourceUrl -replace "'", "''")).Replace('__INSTALLED_SCRIPT__', ($installedScript -replace "'", "''"))
     Invoke-Expression $invoke
+    Remove-LegacySlipArtifacts
 }
 
 function Remove-SlipCommand {
@@ -693,15 +743,17 @@ function Invoke-UnattendedUpgrade {
     if (-not $Quiet) {
         Write-Host "Updating $($script:AppName)..." -ForegroundColor Cyan
     }
-    $ok = Complete-SlipSetup -DisplayName $name -Quiet:$Quiet -NoPrompt -MakeNetworkPrivate:$MakeNetworkPrivate
     $quickShouldRun = $QuickReceive -or (Test-QuickReceive)
+    Stop-QuickReceive
+    Stop-AutoChat
+    $ok = Complete-SlipSetup -DisplayName $name -Quiet:$Quiet -NoPrompt -MakeNetworkPrivate:$MakeNetworkPrivate
+    Enable-AutoChat -Quiet:$Quiet
     if ($quickShouldRun) {
         Enable-QuickReceive -Quiet:$Quiet
     } else {
         Remove-QuickReceiveTask
         Remove-QuickReceiveRunKey
     }
-    Enable-AutoChat -Quiet:$Quiet
     Write-SlipLog "Upgrade completed. version=$($script:Version) setupOk=$([bool]$ok) quickReceive=$([bool]$quickShouldRun) autoChat=true."
     if (-not $Quiet) {
         Write-Host "$($script:AppName) $($script:Version) is installed." -ForegroundColor Green
@@ -2230,7 +2282,7 @@ function Start-QuickListener {
             $payload = '{0}|QUICK|{1}|{2}|{3}|0|quick' -f $script:BeaconPrefix, $port, (ConvertTo-BeaconField $name), (ConvertTo-BeaconField $env:COMPUTERNAME)
             try { [void](Send-BeaconPayload -Payload $payload -Port $script:BeaconPort) } catch { }
             if (-not $listener.Pending()) {
-                Start-Sleep -Milliseconds 200
+                Start-Sleep -Milliseconds 100
                 continue
             }
             $client = $listener.AcceptTcpClient()
@@ -2676,6 +2728,7 @@ function Start-ChatPopup {
     $payload = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Text))
     $from = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($FromName))
     $arg = "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`" chatjoin -Room $Room -Address $Address -Port $Port -PeerName $from -OpeningB64 $payload"
+    Write-TransferDebug 'chat.popup.start' @{ remote = $Address; port = $Port; from = $FromName }
     Start-Process -FilePath powershell.exe -ArgumentList $arg | Out-Null
 }
 
@@ -2700,6 +2753,9 @@ function Enable-AutoChat {
     if (-not $alive) {
         $arg = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`" chatlisten"
         Start-Process -FilePath powershell.exe -ArgumentList $arg -WindowStyle Hidden | Out-Null
+        Write-TransferDebug 'chat.auto.started' @{ pid = 'new'; script = $scriptPath }
+    } else {
+        Write-TransferDebug 'chat.auto.alive' @{ pid = $chatPid; script = $scriptPath }
     }
     if (-not $Quiet) {
         Write-Host 'Auto chat is on. A message from another PC opens a chat window.' -ForegroundColor Green
@@ -2753,13 +2809,14 @@ function Start-ChatListener {
     $listener = New-SlipTcpListener
     $port = ([Net.IPEndPoint]$listener.LocalEndpoint).Port
     Set-Content -LiteralPath $portFile -Value $port -Encoding ASCII
+    Write-TransferDebug 'chat.listener.started' @{ port = $port; pid = $PID; name = (Get-DisplayName) }
     try {
         while ((Get-Content -LiteralPath $flag -Raw -ErrorAction SilentlyContinue) -notmatch 'off') {
             $name = Get-DisplayName
             $payload = '{0}|CHAT|{1}|{2}|{3}|0|chat' -f $script:BeaconPrefix, $port, (ConvertTo-BeaconField $name), (ConvertTo-BeaconField $env:COMPUTERNAME)
             try { [void](Send-BeaconPayload -Payload $payload -Port $script:BeaconPort) } catch { }
             if (-not $listener.Pending()) {
-                Start-Sleep -Milliseconds 200
+                Start-Sleep -Milliseconds 100
                 continue
             }
             $client = $listener.AcceptTcpClient()
@@ -2776,8 +2833,9 @@ function Start-ChatListener {
                         [void][int]::TryParse($parts[2], [ref]$hostPort)
                         $from = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($parts[3]))
                         $text = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($parts[4]))
-                $hostIp = $client.Client.RemoteEndPoint.Address.ToString()
+                        $hostIp = $client.Client.RemoteEndPoint.Address.ToString()
                         if ($hostPort -gt 0 -and $text) {
+                            Write-TransferDebug 'chat.invite.received' @{ remote = $hostIp; port = $hostPort; from = $from; bytes = $text.Length }
                             Start-ChatPopup -Room $room -Address $hostIp -Port $hostPort -FromName $from -Text $text
                             $ack = [Text.Encoding]::ASCII.GetBytes("OK`n")
                             $stream.Write($ack, 0, $ack.Length)
@@ -2792,6 +2850,7 @@ function Start-ChatListener {
         $listener.Stop()
         Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $portFile -Force -ErrorAction SilentlyContinue
+        Write-TransferDebug 'chat.listener.stopped' @{ port = $port; pid = $PID }
     }
 }
 
@@ -2836,8 +2895,10 @@ function Show-ChatSession {
     if (-not $IsHost -and $Stream) {
         try {
             Send-ChatWire -Stream $Stream -Line ("HELLO|{0}" -f [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($me)))
+            Write-TransferDebug 'chat.session.joined' @{ room = $Room; peer = $Title }
         } catch {
             Write-Host 'chat closed' -ForegroundColor DarkGray
+            Write-TransferDebug 'chat.session.join-failed' @{ room = $Room; peer = $Title; error = $_.Exception.Message }
             return
         }
     }
@@ -2856,6 +2917,7 @@ function Show-ChatSession {
                 try { $member.Name = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($hello.Substring(6))) } catch { }
             }
             $members += $member
+            Write-TransferDebug 'chat.member.joined' @{ room = $Room; name = $member.Name }
             Write-ChatNotice 'joined' $member.Name
             Broadcast-Chat ("SYS|joined|{0}" -f $member.Name)
         }
@@ -2870,6 +2932,7 @@ function Show-ChatSession {
                         Write-Host ''
                         Write-Host ("{0}: {1}" -f $member.Name, $text)
                         Write-ChatLog -Room $Room -Kind 'msg' -Name $member.Name -Text $text
+                        Write-TransferDebug 'chat.message.received' @{ room = $Room; from = $member.Name; bytes = $text.Length }
                         Broadcast-Chat ("MSG|{0}|{1}" -f $member.Name, $line.Substring(4)) $member
                     }
                 }
@@ -2877,6 +2940,7 @@ function Show-ChatSession {
         }
         foreach ($member in @($drop)) {
             Write-ChatNotice 'left' $member.Name
+            Write-TransferDebug 'chat.member.left' @{ room = $Room; name = $member.Name }
             Broadcast-Chat ("SYS|left|{0}" -f $member.Name)
             try { $member.Client.Close() } catch { }
             $members = @($members | Where-Object { $_ -ne $member })
@@ -2898,6 +2962,7 @@ function Show-ChatSession {
                         Write-Host ''
                         Write-Host ("{0}: {1}" -f $bits[1], $text)
                         Write-ChatLog -Room $Room -Kind 'msg' -Name $bits[1] -Text $text
+                        Write-TransferDebug 'chat.message.received' @{ room = $Room; from = $bits[1]; bytes = $text.Length }
                     }
                 }
             } catch {
@@ -2913,13 +2978,14 @@ function Show-ChatSession {
                 $packed = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($typed))
                 Write-Host ("{0}: {1}" -f $me, $typed)
                 Write-ChatLog -Room $Room -Kind 'msg' -Name $me -Text $typed
+                Write-TransferDebug 'chat.message.sent' @{ room = $Room; bytes = $typed.Length }
                 if ($IsHost) { Broadcast-Chat ("MSG|{0}|{1}" -f $me, $packed) }
                 elseif ($Stream) { Send-ChatWire -Stream $Stream -Line ("MSG|{0}" -f $packed) }
             }
             continue
         }
         if (-not $Host.UI.RawUI.KeyAvailable) {
-            Start-Sleep -Milliseconds 40
+            Start-Sleep -Milliseconds 15
             continue
         }
         $key = Read-SlipKey
@@ -2932,6 +2998,7 @@ function Show-ChatSession {
             $packed = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($typed))
             Write-Host ("{0}: {1}" -f $me, $typed)
             Write-ChatLog -Room $Room -Kind 'msg' -Name $me -Text $typed
+            Write-TransferDebug 'chat.message.sent' @{ room = $Room; bytes = $typed.Length }
             if ($IsHost) { Broadcast-Chat ("MSG|{0}|{1}" -f $me, $packed) }
             elseif ($Stream) { Send-ChatWire -Stream $Stream -Line ("MSG|{0}" -f $packed) }
             continue
@@ -2947,12 +3014,14 @@ function Show-ChatSession {
         Write-Host ''
         Write-Host 'chat closed' -ForegroundColor DarkGray
         Write-ChatLog -Room $Room -Kind 'closed' -Name $me -Text ''
+        Write-TransferDebug 'chat.session.closed' @{ room = $Room; role = 'host' }
         foreach ($member in @($members)) { try { $member.Client.Close() } catch { } }
         try { $Listener.Stop() } catch { }
     }
     elseif ($Stream) {
         try { Send-ChatWire -Stream $Stream -Line 'BYE' } catch { }
         try { $Stream.Close() } catch { }
+        Write-TransferDebug 'chat.session.closed' @{ room = $Room; role = 'guest' }
     }
 }
 
@@ -2981,8 +3050,11 @@ function Show-ChatPeople {
         if ($choice -eq 'TOGGLE') { $selected[$cursor] = -not $selected[$cursor]; continue }
         if ($choice -match '^[Qq]$') { return $null }
         if ($choice -match '^\d+$') {
-            $idx = [int]$choice - 1
-            if ($idx -ge 0 -and $idx -lt $People.Count) { $selected[$idx] = -not $selected[$idx]; $cursor = $idx }
+            $number = 0
+            if ([int]::TryParse($choice, [ref]$number)) {
+                $idx = $number - 1
+                if ($idx -ge 0 -and $idx -lt $People.Count) { $selected[$idx] = -not $selected[$idx]; $cursor = $idx }
+            }
             continue
         }
         if ($choice -match '^[Cc]$') {
@@ -3002,8 +3074,12 @@ function Invoke-ChatInvite {
     param($Person, [string]$Room, [int]$HostPort, [string]$Text)
     $client = New-Object System.Net.Sockets.TcpClient
     try {
+        Write-TransferDebug 'chat.invite.start' @{ target = $Person.Display; address = $Person.IP; port = $Person.Port; room = $Room }
         $wait = $client.BeginConnect($Person.IP, [int]$Person.Port, $null, $null)
-        if (-not $wait.AsyncWaitHandle.WaitOne(4000, $false)) { return $false }
+        if (-not $wait.AsyncWaitHandle.WaitOne(4000, $false)) {
+            Write-TransferDebug 'chat.invite.failed' @{ target = $Person.Display; address = $Person.IP; port = $Person.Port; reason = 'timeout' }
+            return $false
+        }
         $client.EndConnect($wait)
         $stream = $client.GetStream()
         $from = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes((Get-DisplayName)))
@@ -3014,8 +3090,13 @@ function Invoke-ChatInvite {
         $stream.ReadTimeout = 4000
         $reader = New-Object IO.StreamReader($stream)
         $ack = $reader.ReadLine()
-        return ($ack -eq 'OK')
-    } catch { return $false }
+        $ok = ($ack -eq 'OK')
+        Write-TransferDebug $(if ($ok) { 'chat.invite.accepted' } else { 'chat.invite.failed' }) @{ target = $Person.Display; address = $Person.IP; port = $Person.Port; room = $Room; ack = $ack }
+        return $ok
+    } catch {
+        Write-TransferDebug 'chat.invite.failed' @{ target = $Person.Display; address = $Person.IP; port = $Person.Port; error = $_.Exception.Message }
+        return $false
+    }
     finally { try { $client.Close() } catch { } }
 }
 
@@ -3030,6 +3111,7 @@ function Start-ChatWith {
         if (Invoke-ChatInvite -Person $person -Room $room -HostPort $port -Text $Text) { $reached += $person }
         else { $missed += $person }
     }
+    Write-TransferDebug 'chat.start.summary' @{ room = $room; reached = $reached.Count; missed = $missed.Count; hostPort = $port }
     $names = @($reached | ForEach-Object { $_.Display })
     $title = if ($names.Count -gt 0) { $names -join ', ' } else { 'waiting' }
     if ($missed.Count -gt 0) {
@@ -3052,6 +3134,7 @@ function Show-StartChat {
             $_.Token -eq 'CHAT' -and $_.Port -gt 0 -and ($mine -notcontains $_.IP)
         })
     } catch { $people = @() }
+    Write-TransferDebug 'chat.discovery' @{ found = $people.Count }
     if ($people.Count -eq 0) {
         Write-Host 'No other PC with Auto chat was found.' -ForegroundColor Yellow
         Write-Host 'That PC needs Slip installed. Auto chat is on unless it was turned off.'
