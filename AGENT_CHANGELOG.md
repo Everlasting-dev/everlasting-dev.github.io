@@ -3,6 +3,13 @@
 Internal handoff log for Cursor agents and plugins. Newest entries first.
 Read before editing; append after substantive changes.
 
+## 2026-09-30 - shorter menus, version 1.3.0, auto chat
+
+- **Why:** the published `get` script should match the local Slip menu and the auto chat listener
+- **Changes:** replaced `get` with version 1.3.0. Main menu is Send, Receive, Chat, Folders, and More. Repair and Upgrade are under Diagnostics. Auto chat is on by default.
+- **Files:** `get`, `AGENT_CHANGELOG.md`
+- **Notes:** An already installed PC gets this by choosing Diagnostics, Upgrade.
+
 ## 2026-09-29 - old PC rescue and Quick Receive diagnostics
 
 - **Why:** One upgraded PC still used an old PowerShell profile function that launched `slip.ps1` without `-ExecutionPolicy Bypass`, Repair hit the old self-copy bug, a pasted/repeated number crashed the send picker, and Quick Receive discovery needed a fallback when UDP beacons do not appear.

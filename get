@@ -12,6 +12,7 @@ $script:RawArgs = @($args)
 $script:RuleTcp = "$($script:AppName) TCP"
 $script:RuleUdp = "$($script:AppName) Discovery"
 $script:BeaconPrefix = $script:AppName.ToUpperInvariant() + '1'
+$script:Version = '1.3.0'
 
 function Initialize-SlipSecurityProtocol {
     try {
@@ -74,33 +75,184 @@ function Wait-Enter {
     [void](Read-Host)
 }
 
+# Network helpers are kept in one scriptblock so the background presence loop in
+# Start-PresenceLoop can dot-source the same definitions into its runspace
+# instead of carrying a second copy of them.
+$script:NetHelpers = {
+    function Test-VirtualAdapterAlias {
+        param([string]$Alias)
+        if (-not $Alias) { return $false }
+        $pattern = '(?i)(vEthernet|WSL|Hyper-V|Default Switch|VirtualBox|VMware|Docker|Loopback|Bluetooth|TAP-Windows|Tailscale|ZeroTier|Npcap|Local Area Connection\* \d+)'
+        return [bool]([regex]::IsMatch($Alias, $pattern))
+    }
+
+    function Get-SubnetBroadcast {
+        param([string]$Address, [int]$PrefixLength)
+        try {
+            if ($PrefixLength -lt 1 -or $PrefixLength -gt 31) { return '255.255.255.255' }
+            $bytes = ([Net.IPAddress]::Parse($Address)).GetAddressBytes()
+            for ($i = 0; $i -lt 4; $i++) {
+                $take = [Math]::Max(0, [Math]::Min(8, $PrefixLength - ($i * 8)))
+                $maskByte = 0
+                if ($take -gt 0) { $maskByte = (0xFF -shl (8 - $take)) -band 0xFF }
+                $bytes[$i] = [byte](($bytes[$i] -band $maskByte) -bor ((-bnot $maskByte) -band 0xFF))
+            }
+            return ([Net.IPAddress]$bytes).ToString()
+        } catch {
+            return '255.255.255.255'
+        }
+    }
+
+    function Get-LanAddressRows {
+        $rows = @()
+        try {
+            $profiles = @{}
+            try {
+                foreach ($item in @(Get-NetConnectionProfile -ErrorAction Stop)) {
+                    $profiles[[int]$item.InterfaceIndex] = $item
+                }
+            } catch { }
+            $metrics = @{}
+            try {
+                foreach ($item in @(Get-NetIPInterface -AddressFamily IPv4 -ErrorAction Stop)) {
+                    $metrics[[int]$item.InterfaceIndex] = [int]$item.InterfaceMetric
+                }
+            } catch { }
+            foreach ($addr in @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop)) {
+                $ip = [string]$addr.IPAddress
+                if ($ip -like '127.*' -or $ip -like '169.254.*') { continue }
+                if ($addr.PrefixOrigin -eq 'WellKnown') { continue }
+                if ($addr.SkipAsSource) { continue }
+                $index = [int]$addr.InterfaceIndex
+                $alias = [string]$addr.InterfaceAlias
+                $metric = 9999
+                if ($metrics.ContainsKey($index)) { $metric = $metrics[$index] }
+                $category = ''
+                if ($profiles.ContainsKey($index)) { $category = [string]$profiles[$index].NetworkCategory }
+                $rows += New-Object psobject -Property @{
+                    IPAddress      = $ip
+                    InterfaceIndex = $index
+                    InterfaceAlias = $alias
+                    PrefixLength   = [int]$addr.PrefixLength
+                    Metric         = $metric
+                    NetworkCategory = $category
+                    HasProfile     = $profiles.ContainsKey($index)
+                    Virtual        = (Test-VirtualAdapterAlias $alias)
+                }
+            }
+        } catch {
+            $rows = @()
+        }
+        if ($rows.Count -eq 0) { return @() }
+        # A real adapter that Windows knows as a network comes first, then lowest
+        # interface metric, so the address another PC can reach is always [0].
+        $sorted = $rows | Sort-Object -Property @(
+            @{ Expression = { if ($_.Virtual) { 2 } elseif ($_.HasProfile) { 0 } else { 1 } } },
+            @{ Expression = { $_.Metric } },
+            @{ Expression = { $_.IPAddress } }
+        )
+        return @($sorted)
+    }
+
+    function Get-BroadcastTargets {
+        $rows = @(Get-LanAddressRows)
+        $real = @($rows | Where-Object { -not $_.Virtual })
+        if ($real.Count -eq 0) { $real = @($rows | Where-Object { $_.HasProfile }) }
+        $targets = @()
+        foreach ($row in $real) {
+            $targets += New-Object psobject -Property @{
+                Local     = $row.IPAddress
+                Broadcast = (Get-SubnetBroadcast -Address $row.IPAddress -PrefixLength $row.PrefixLength)
+            }
+        }
+        if ($targets.Count -eq 0) {
+            $targets += New-Object psobject -Property @{ Local = ''; Broadcast = '255.255.255.255' }
+        }
+        return @($targets)
+    }
+
+    function Send-BeaconPayload {
+        param([string]$Payload, [int]$Port)
+        # An unbound socket sends 255.255.255.255 out one interface only, whichever
+        # one the routing table picks by metric. On a PC with WSL, Hyper-V, or
+        # Wi-Fi Direct adapters that is often not the LAN, so the beacon never
+        # leaves the machine. Bind a socket to each real address instead.
+        $bytes = [Text.Encoding]::UTF8.GetBytes($Payload)
+        $sent = 0
+        foreach ($target in @(Get-BroadcastTargets)) {
+            $udp = $null
+            try {
+                $udp = New-Object System.Net.Sockets.UdpClient
+                $udp.EnableBroadcast = $true
+                if ($target.Local) {
+                    $udp.Client.Bind((New-Object System.Net.IPEndPoint ([Net.IPAddress]::Parse($target.Local), 0)))
+                }
+                [void]$udp.Send($bytes, $bytes.Length, $target.Broadcast, $Port)
+                if ($target.Broadcast -ne '255.255.255.255') {
+                    try { [void]$udp.Send($bytes, $bytes.Length, '255.255.255.255', $Port) } catch { }
+                }
+                $sent++
+            } catch { }
+            finally { if ($udp) { try { $udp.Close() } catch { } } }
+        }
+        return $sent
+    }
+}
+. $script:NetHelpers
+
 function Get-LanIPv4 {
+    param([switch]$IncludeVirtual)
+    $rows = @(Get-LanAddressRows)
+    if ($rows.Count -gt 0) {
+        if (-not $IncludeVirtual) {
+            $real = @($rows | Where-Object { -not $_.Virtual })
+            if ($real.Count -gt 0) { return @($real | ForEach-Object { $_.IPAddress }) }
+        }
+        return @($rows | ForEach-Object { $_.IPAddress })
+    }
     $ips = @()
     try {
-        $ips = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop |
+        $ips = @([Net.Dns]::GetHostAddresses([Net.Dns]::GetHostName()) |
             Where-Object {
-                $_.IPAddress -notlike '127.*' -and
-                $_.IPAddress -notlike '169.254.*' -and
-                $_.PrefixOrigin -ne 'WellKnown'
+                $_.AddressFamily -eq 'InterNetwork' -and
+                $_.ToString() -notlike '127.*' -and
+                $_.ToString() -notlike '169.254.*'
             } |
-            Select-Object -ExpandProperty IPAddress)
+            ForEach-Object { $_.ToString() })
     } catch {
         $ips = @()
     }
-    if ($ips.Count -eq 0) {
-        try {
-            $ips = @([Net.Dns]::GetHostAddresses([Net.Dns]::GetHostName()) |
-                Where-Object {
-                    $_.AddressFamily -eq 'InterNetwork' -and
-                    $_.ToString() -notlike '127.*' -and
-                    $_.ToString() -notlike '169.254.*'
-                } |
-                ForEach-Object { $_.ToString() })
-        } catch {
-            $ips = @()
-        }
-    }
     return $ips
+}
+
+function Get-ActiveNetworkProfiles {
+    $rows = @()
+    try {
+        foreach ($item in @(Get-NetConnectionProfile -ErrorAction Stop)) {
+            if (Test-VirtualAdapterAlias ([string]$item.InterfaceAlias)) { continue }
+            $rows += $item
+        }
+    } catch {
+        $rows = @()
+    }
+    return @($rows)
+}
+
+function Get-PublicNetworkProfiles {
+    return @(Get-ActiveNetworkProfiles | Where-Object {
+        $_.NetworkCategory -ne 'Private' -and $_.NetworkCategory -ne 'DomainAuthenticated'
+    })
+}
+
+function Set-ActiveNetworksPrivate {
+    $changed = 0
+    foreach ($item in (Get-PublicNetworkProfiles)) {
+        try {
+            Set-NetConnectionProfile -InterfaceIndex $item.InterfaceIndex -NetworkCategory Private -ErrorAction Stop
+            $changed++
+        } catch { }
+    }
+    return $changed
 }
 
 function Get-DisplayName {
@@ -180,9 +332,15 @@ function Get-ProfilePaths {
 }
 
 function Get-SlipFunctionBlock {
+    $installedScript = Get-InstalledScriptPath
 @"
 # >>> $($script:CommandName) >>>
 function $($script:CommandName) {
+    `$local = '$installedScript'
+    if (Test-Path -LiteralPath `$local) {
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File `$local menu @args
+        return
+    }
     `$tmp = Join-Path `$env:TEMP '$($script:CommandName)-get.ps1'
     Remove-Item -LiteralPath `$tmp -Force -ErrorAction SilentlyContinue
     try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
@@ -362,7 +520,7 @@ function Ensure-SlipFiles {
 }
 
 function Complete-SlipSetup {
-    param([string]$DisplayName, [switch]$Quiet)
+    param([string]$DisplayName, [switch]$Quiet, [switch]$NoPrompt, [switch]$MakeNetworkPrivate)
     Ensure-SlipFiles -DisplayName $DisplayName
     $ready = (Test-FirewallRule $script:RuleTcp) -and (Test-FirewallRule $script:RuleUdp)
     if (-not $ready) {
@@ -388,6 +546,20 @@ function Complete-SlipSetup {
         }
         return $false
     }
+    # The rules exist, but a rule scoped to Private does nothing on an interface
+    # Windows has tagged Public, so setup is not really finished until that is
+    # sorted. An unattended run only logs it; it must not stop for a prompt.
+    if (@(Get-PublicNetworkProfiles).Count -gt 0) {
+        if ($MakeNetworkPrivate) {
+            [void](Invoke-MakeNetworkPrivate -Quiet:$Quiet -NoPrompt)
+        } elseif ($NoPrompt -or $Quiet) {
+            # An unattended run must never stop on a Read-Host, so it only says so.
+            Write-SlipLog 'Setup finished but the active network is Public, so nothing can reach this PC.'
+            if (-not $Quiet) { Show-NetworkWarning }
+        } else {
+            [void](Invoke-MakeNetworkPrivate)
+        }
+    }
     Set-Content -LiteralPath (Get-InstalledPath) -Value (Get-Date -Format 'o') -Encoding ASCII
     return $true
 }
@@ -402,13 +574,14 @@ function ConvertTo-CleanDisplayName {
 }
 
 function Invoke-UnattendedInstall {
-    param([string]$DisplayName, [switch]$QuickReceive, [switch]$Quiet)
+    param([string]$DisplayName, [switch]$QuickReceive, [switch]$Quiet, [switch]$MakeNetworkPrivate)
     $name = ConvertTo-CleanDisplayName -Name $DisplayName -Fallback $env:COMPUTERNAME
     if (-not $Quiet) {
         Write-Host "Installing $($script:AppName)..." -ForegroundColor Cyan
     }
-    $ok = Complete-SlipSetup -DisplayName $name -Quiet:$Quiet
+    $ok = Complete-SlipSetup -DisplayName $name -Quiet:$Quiet -NoPrompt -MakeNetworkPrivate:$MakeNetworkPrivate
     if ($ok) {
+        Enable-AutoChat -Quiet:$Quiet
         if ($QuickReceive) {
             Enable-QuickReceive -Quiet:$Quiet
         }
@@ -422,6 +595,7 @@ function Invoke-UnattendedInstall {
             if ($QuickReceive) {
                 Write-Host 'Quick receive: on'
             }
+            Write-Host 'Auto chat: on'
         }
         return $true
     }
@@ -432,7 +606,7 @@ function Invoke-UnattendedInstall {
 }
 
 function Invoke-UnattendedUpgrade {
-    param([string]$DisplayName, [switch]$QuickReceive, [switch]$Quiet)
+    param([string]$DisplayName, [switch]$QuickReceive, [switch]$Quiet, [switch]$MakeNetworkPrivate)
     $name = $null
     if (-not [string]::IsNullOrWhiteSpace($DisplayName)) {
         $name = ConvertTo-CleanDisplayName -Name $DisplayName -Fallback $env:COMPUTERNAME
@@ -440,7 +614,7 @@ function Invoke-UnattendedUpgrade {
     if (-not $Quiet) {
         Write-Host "Updating $($script:AppName)..." -ForegroundColor Cyan
     }
-    $ok = Complete-SlipSetup -DisplayName $name -Quiet:$Quiet
+    $ok = Complete-SlipSetup -DisplayName $name -Quiet:$Quiet -NoPrompt -MakeNetworkPrivate:$MakeNetworkPrivate
     if ($ok) {
         $quickShouldRun = $QuickReceive -or (Test-QuickReceive)
         if ($quickShouldRun) {
@@ -449,6 +623,7 @@ function Invoke-UnattendedUpgrade {
             Remove-QuickReceiveTask
             Remove-QuickReceiveRunKey
         }
+        if (Test-AutoChat) { Enable-AutoChat -Quiet:$Quiet } else { Stop-AutoChat }
         Write-SlipLog "Upgrade completed. quickReceive=$([bool]$quickShouldRun)."
         if (-not $Quiet) {
             Write-Host "$($script:AppName) is up to date." -ForegroundColor Green
@@ -459,6 +634,7 @@ function Invoke-UnattendedUpgrade {
             } else {
                 Write-Host 'Quick receive: off'
             }
+            if (Test-AutoChat) { Write-Host 'Auto chat: on' } else { Write-Host 'Auto chat: off' }
         }
         return $true
     }
@@ -476,14 +652,61 @@ function Read-CleanName {
 }
 
 function Show-NetworkWarning {
-    try {
-        $profiles = @(Get-NetConnectionProfile -ErrorAction Stop | Where-Object {
-            $_.NetworkCategory -ne 'Private' -and $_.NetworkCategory -ne 'DomainAuthenticated'
-        })
-        foreach ($item in $profiles) {
-            Write-Host "This network ($($item.Name)) is $($item.NetworkCategory). Firewall rules apply to Private networks." -ForegroundColor Yellow
+    $public = @(Get-PublicNetworkProfiles)
+    if ($public.Count -eq 0) { return }
+    foreach ($item in $public) {
+        Write-Host ("This network ({0}) is {1}. The {2} rules only apply to Private" -f $item.Name, $item.NetworkCategory, $script:AppName) -ForegroundColor Yellow
+        Write-Host 'networks, so other PCs cannot reach this one yet.' -ForegroundColor Yellow
+    }
+        Write-Host 'Diagnostics has Network: make Private, which fixes this.' -ForegroundColor Yellow
+}
+
+function Invoke-MakeNetworkPrivate {
+    param([switch]$Quiet, [switch]$NoPrompt)
+    $public = @(Get-PublicNetworkProfiles)
+    if ($public.Count -eq 0) {
+        if (-not $Quiet) {
+            if (@(Get-ActiveNetworkProfiles).Count -eq 0) {
+                Write-Host 'This PC is not on a network right now.' -ForegroundColor Yellow
+            } else {
+                Write-Host 'This network is already Private. Nothing to change.' -ForegroundColor Green
+            }
         }
-    } catch {}
+        return $true
+    }
+    if (-not $Quiet) {
+        Write-Host ''
+        foreach ($item in $public) {
+            Write-Host ("Network: {0} ({1}) is {2}." -f $item.Name, $item.InterfaceAlias, $item.NetworkCategory) -ForegroundColor Yellow
+        }
+        Write-Host ''
+        Write-Host "$($script:AppName) only opens its ports on Private networks, so nothing can"
+        Write-Host 'reach this PC while the network is marked Public.'
+        Write-Host ''
+        Write-Host 'Marking it Private also turns on normal Windows network discovery' -ForegroundColor DarkGray
+        Write-Host 'for this network. Only do it on a network you trust, such as home' -ForegroundColor DarkGray
+        Write-Host 'or the office, not on cafe or hotel wifi.' -ForegroundColor DarkGray
+        Write-Host ''
+    }
+    if (-not $NoPrompt) {
+        $answer = Read-Host '[Y] Mark Private  [N] Leave it'
+        if ($answer -notmatch '^[Yy]') { return $false }
+    }
+    if (Test-IsAdmin) {
+        [void](Set-ActiveNetworksPrivate)
+    } else {
+        if (-not $Quiet) { Write-Host 'Windows needs approval to change the network type.' -ForegroundColor Yellow }
+        [void](Invoke-ElevatedEntry -Entry 'netprivate')
+    }
+    if (@(Get-PublicNetworkProfiles).Count -eq 0) {
+        if (-not $Quiet) { Write-Host 'This network is Private now. Other PCs can reach this one.' -ForegroundColor Green }
+        return $true
+    }
+    if (-not $Quiet) {
+        Write-Host 'The network is still Public.' -ForegroundColor Red
+        Write-Host 'Settings > Network and internet > your network > Network profile type > Private' -ForegroundColor DarkGray
+    }
+    return $false
 }
 
 function Invoke-GetSlipFromLauncher {
@@ -513,7 +736,8 @@ function Invoke-GetSlipFromLauncher {
             Write-Host "Type $($script:CommandName) in this window." -ForegroundColor Green
             Write-Host 'New Command Prompt and PowerShell windows can type it too.' -ForegroundColor Green
             Write-Host 'A window that was already open before install needs to be closed and opened once.' -ForegroundColor DarkGray
-            Write-Host 'Send files is the first choice.' -ForegroundColor Green
+            Write-Host 'Send files is the first choice. Auto chat is on.' -ForegroundColor Green
+            Enable-AutoChat -Quiet
             Show-NetworkWarning
             Write-Host ''
             Write-Host (Get-HowToText)
@@ -551,6 +775,12 @@ function Show-RepairScreen {
             Remove-QuickReceiveTask
             Remove-QuickReceiveRunKey
         }
+        if (Test-AutoChat) {
+            Enable-AutoChat -Quiet
+            Write-Host 'Auto chat startup refreshed.' -ForegroundColor Green
+        } else {
+            Stop-AutoChat
+        }
         Write-Host 'Repair finished. Your Outbox and Inbox files are still there.' -ForegroundColor Green
         Write-Host "New Command Prompt and PowerShell windows can type: $($script:CommandName)" -ForegroundColor Green
         Write-Host ("Already-open windows can run: {0}" -f (Join-Path (Get-SlipCommandDir) "$($script:CommandName).cmd")) -ForegroundColor DarkGray
@@ -571,6 +801,7 @@ function Invoke-RemoveSlip {
     Remove-ProfileBlock
     Remove-SlipCommand
     Stop-QuickReceive
+    Stop-AutoChat
     if ((Test-FirewallRule $script:RuleTcp) -or (Test-FirewallRule $script:RuleUdp)) {
         if (Test-IsAdmin) {
             Uninstall-FirewallRules
@@ -591,6 +822,7 @@ function Invoke-RemoveSlip {
 function Show-Status {
     Clear-Host
     Write-Host 'Status' -ForegroundColor Cyan
+    Write-Host ("Version {0}" -f $script:Version) -ForegroundColor DarkGray
     Write-Host ''
     Write-Host "Windows name: $env:COMPUTERNAME"
     Write-Host ("Shown as:     " + (Get-DisplayName))
@@ -600,11 +832,35 @@ function Show-Status {
     Write-Host ''
     if (Test-SlipInstalled) { Write-Host 'Setup marker: present' -ForegroundColor Green }
     else { Write-Host 'Setup marker: not installed' -ForegroundColor Yellow }
+    $rulesOk = $true
     foreach ($rule in @($script:RuleTcp, $script:RuleUdp)) {
         if (Test-FirewallRule $rule) { Write-Host "Firewall:     $rule  ok" -ForegroundColor Green }
-        else { Write-Host "Firewall:     $rule  missing" -ForegroundColor Yellow }
+        else {
+            Write-Host "Firewall:     $rule  missing" -ForegroundColor Yellow
+            $rulesOk = $false
+        }
     }
-    Show-NetworkWarning
+    $active = @(Get-ActiveNetworkProfiles)
+    $public = @(Get-PublicNetworkProfiles)
+    if ($active.Count -eq 0) {
+        Write-Host 'Network:      not connected' -ForegroundColor Yellow
+    } else {
+        foreach ($item in $active) {
+            $colour = 'Green'
+            if ($item.NetworkCategory -ne 'Private' -and $item.NetworkCategory -ne 'DomainAuthenticated') { $colour = 'Yellow' }
+            Write-Host ("Network:      {0} ({1})  {2}" -f $item.Name, $item.InterfaceAlias, $item.NetworkCategory) -ForegroundColor $colour
+        }
+    }
+    if (-not $rulesOk) {
+        Write-Host 'Receiving:    blocked, firewall rules are missing. Use Repair.' -ForegroundColor Red
+    } elseif ($active.Count -eq 0) {
+        Write-Host 'Receiving:    blocked, this PC is not on a network.' -ForegroundColor Red
+    } elseif ($public.Count -gt 0) {
+        Write-Host 'Receiving:    blocked, this network is not Private.' -ForegroundColor Red
+        Write-Host '              Diagnostics has Network: make Private.' -ForegroundColor DarkGray
+    } else {
+        Write-Host 'Receiving:    ready' -ForegroundColor Green
+    }
     Write-Host ''
     foreach ($pair in @(
         @{ Label = 'Outbox'; Path = (Get-OutboxPath) },
@@ -1020,7 +1276,7 @@ function Handle-HttpClient {
 }
 
 function Send-Beacon {
-    param($Udp, [string]$Token, [int]$Port, [long]$Size, [string]$FileName)
+    param([string]$Token, [int]$Port, [long]$Size, [string]$FileName)
     $msg = @(
         $script:BeaconPrefix,
         $Token,
@@ -1030,8 +1286,7 @@ function Send-Beacon {
         $Size,
         (ConvertTo-BeaconField $FileName)
     ) -join '|'
-    $bytes = [Text.Encoding]::UTF8.GetBytes($msg)
-    [void]$Udp.Send($bytes, $bytes.Length, '255.255.255.255', $script:BeaconPort)
+    return (Send-BeaconPayload -Payload $msg -Port $script:BeaconPort)
 }
 
 function Start-ShareServer {
@@ -1062,8 +1317,6 @@ function Start-ShareServer {
     $pin = (Get-Random -Minimum 0 -Maximum 1000000).ToString('000000')
     $size = [long](Get-Item -LiteralPath $FilePath).Length
     Write-TransferDebug 'send.pin.ready' @{ file = $DownloadName; size = $size; port = $port; quiet = [bool]$Quiet }
-    $udp = New-Object System.Net.Sockets.UdpClient
-    $udp.EnableBroadcast = $true
     $done = $false
     try {
         if ($ReadyFile) {
@@ -1091,7 +1344,7 @@ function Start-ShareServer {
         $lastBeacon = [datetime]::MinValue
         while (-not $done -and (Get-Date) -lt $deadline) {
             if (((Get-Date) - $lastBeacon).TotalSeconds -ge 1) {
-                try { Send-Beacon $udp $token $port $size $DownloadName } catch {}
+                try { [void](Send-Beacon $token $port $size $DownloadName) } catch {}
                 $lastBeacon = Get-Date
             }
             if (-not $Quiet) {
@@ -1128,7 +1381,6 @@ function Start-ShareServer {
         }
     } finally {
         try { $listener.Stop() } catch {}
-        try { $udp.Close() } catch {}
         if ($TempToDelete) {
             Remove-Item -LiteralPath $TempToDelete -Force -ErrorAction SilentlyContinue
         }
@@ -1251,7 +1503,7 @@ function Show-SendFiles {
         $quickTarget = $null
         $sendTotal = 0L
         foreach ($item in $picked) { $sendTotal += Get-TreeSize $item }
-        $mine = @(Get-LanIPv4)
+        $mine = @(Get-LanIPv4 -IncludeVirtual)
         $quick = @()
         Clear-Host
         Write-Host 'Choose a PC' -ForegroundColor Cyan
@@ -1420,6 +1672,7 @@ function Read-SlipKey {
     switch ($code) {
         38 { $name = 'UpArrow' }
         40 { $name = 'DownArrow' }
+        8 { $name = 'Backspace' }
         13 { $name = 'Enter' }
         27 { $name = 'Escape' }
         32 { $name = 'Spacebar' }
@@ -1471,6 +1724,7 @@ function Read-ArrowMenu {
         Clear-Host
         if ($Title) {
             Write-Host $Title -ForegroundColor Cyan
+            Write-Host ("Version {0}" -f $script:Version) -ForegroundColor DarkGray
             Write-Host ''
         }
         foreach ($line in $Lines) {
@@ -1634,14 +1888,8 @@ function Open-InboxFront {
 
 function Send-PresenceBeacon {
     param([string]$Kind, [int]$Port)
-    $udp = New-Object System.Net.Sockets.UdpClient
-    try {
-        $udp.EnableBroadcast = $true
-        $payload = '{0}|{1}|{2}|{3}|{4}|0|{5}' -f $script:BeaconPrefix, $Kind, $Port, (ConvertTo-BeaconField (Get-DisplayName)), (ConvertTo-BeaconField $env:COMPUTERNAME), $Kind.ToLower()
-        $bytes = [Text.Encoding]::UTF8.GetBytes($payload)
-        [void]$udp.Send($bytes, $bytes.Length, '255.255.255.255', $script:BeaconPort)
-    }
-    finally { $udp.Close() }
+    $payload = '{0}|{1}|{2}|{3}|{4}|0|{5}' -f $script:BeaconPrefix, $Kind, $Port, (ConvertTo-BeaconField (Get-DisplayName)), (ConvertTo-BeaconField $env:COMPUTERNAME), $Kind.ToLower()
+    return (Send-BeaconPayload -Payload $payload -Port $script:BeaconPort)
 }
 
 function Start-PresenceLoop {
@@ -1649,25 +1897,18 @@ function Start-PresenceLoop {
     if (Test-Path -LiteralPath $stopFile) { Remove-Item -LiteralPath $stopFile -Force }
     $ps = [PowerShell]::Create()
     [void]$ps.AddScript({
-        param($StopFile, $Name, $Computer, $Port, $Prefix)
-        $udp = New-Object System.Net.Sockets.UdpClient
-        $udp.EnableBroadcast = $true
-        try {
-            while (-not (Test-Path -LiteralPath $StopFile)) {
-                $payload = '{0}|OPEN|0|{1}|{2}|0|open' -f $Prefix, $Name, $Computer
-                $bytes = [Text.Encoding]::UTF8.GetBytes($payload)
-                try {
-                    [void]$udp.Send($bytes, $bytes.Length, '255.255.255.255', $Port)
-                } catch { }
-                $left = 10
-                while ($left -gt 0 -and -not (Test-Path -LiteralPath $StopFile)) {
-                    Start-Sleep -Milliseconds 100
-                    $left--
-                }
+        param($StopFile, $Name, $Computer, $Port, $Prefix, $Helpers)
+        . ([scriptblock]::Create($Helpers))
+        while (-not (Test-Path -LiteralPath $StopFile)) {
+            $payload = '{0}|OPEN|0|{1}|{2}|0|open' -f $Prefix, $Name, $Computer
+            try { [void](Send-BeaconPayload -Payload $payload -Port $Port) } catch { }
+            $left = 10
+            while ($left -gt 0 -and -not (Test-Path -LiteralPath $StopFile)) {
+                Start-Sleep -Milliseconds 100
+                $left--
             }
         }
-        finally { $udp.Close() }
-    }).AddArgument($stopFile).AddArgument((ConvertTo-BeaconField (Get-DisplayName))).AddArgument((ConvertTo-BeaconField $env:COMPUTERNAME)).AddArgument($script:BeaconPort).AddArgument($script:BeaconPrefix)
+    }).AddArgument($stopFile).AddArgument((ConvertTo-BeaconField (Get-DisplayName))).AddArgument((ConvertTo-BeaconField $env:COMPUTERNAME)).AddArgument($script:BeaconPort).AddArgument($script:BeaconPrefix).AddArgument($script:NetHelpers.ToString())
     $handle = $ps.BeginInvoke()
     return @{ PowerShell = $ps; Handle = $handle; StopFile = $stopFile }
 }
@@ -1904,8 +2145,6 @@ function Start-QuickListener {
     $dir = Split-Path -Parent $pidFile
     if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
     Set-Content -LiteralPath $pidFile -Value $PID -Encoding ASCII
-    $udp = New-Object System.Net.Sockets.UdpClient
-    $udp.EnableBroadcast = $true
     $listener = New-SlipTcpListener
     $port = ([Net.IPEndPoint]$listener.LocalEndpoint).Port
     Set-Content -LiteralPath (Get-ListenPortPath) -Value $port -Encoding ASCII
@@ -1919,12 +2158,7 @@ function Start-QuickListener {
                 if ($stored) { $name = $stored }
             }
             $payload = '{0}|QUICK|{1}|{2}|{3}|0|quick' -f $script:BeaconPrefix, $port, (ConvertTo-BeaconField $name), (ConvertTo-BeaconField $env:COMPUTERNAME)
-            $bytes = [Text.Encoding]::UTF8.GetBytes($payload)
-            try {
-                $endpoint = New-Object System.Net.IPEndPoint ([Net.IPAddress]::Broadcast, $script:BeaconPort)
-                [void]$udp.Send($bytes, $bytes.Length, $endpoint)
-            }
-            catch { }
+            try { [void](Send-BeaconPayload -Payload $payload -Port $script:BeaconPort) } catch { }
             if (-not $listener.Pending()) {
                 Start-Sleep -Milliseconds 200
                 continue
@@ -2006,7 +2240,6 @@ function Start-QuickListener {
     }
     finally {
         try { $listener.Stop() } catch { }
-        try { $udp.Close() } catch { }
         Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath (Get-ListenPortPath) -Force -ErrorAction SilentlyContinue
     }
@@ -2016,7 +2249,7 @@ function Test-OwnAddress {
     param([string]$Address)
     if (-not $Address) { return $true }
     if ($Address -eq '127.0.0.1' -or $Address -eq '::1') { return $true }
-    return (@(Get-LanIPv4) -contains $Address)
+    return (@(Get-LanIPv4 -IncludeVirtual) -contains $Address)
 }
 
 function Show-CheckConnection {
@@ -2027,13 +2260,21 @@ function Show-CheckConnection {
     $mine = @(Get-LanIPv4)
     if ($mine.Count -eq 0) { Write-Host 'LAN address: none' }
     else { Write-Host ("LAN address: " + ($mine -join ', ')) }
+    $hidden = @(Get-LanIPv4 -IncludeVirtual | Where-Object { $mine -notcontains $_ })
+    if ($hidden.Count -gt 0) {
+        Write-Host ("Ignored (virtual adapter): " + ($hidden -join ', ')) -ForegroundColor DarkGray
+    }
+    if (@(Get-PublicNetworkProfiles).Count -gt 0) {
+        Write-Host ''
+        Show-NetworkWarning
+    }
     Write-Host ''
     Write-Host 'Looking for other PCs...'
     $raw = @(Receive-Beacons -Seconds 4 | Where-Object { -not (Test-OwnAddress $_.IP) })
     $best = @{}
     foreach ($share in $raw) {
         $rank = 1
-        if ($share.Token -eq 'QUICK') { $rank = 2 }
+        if ($share.Token -eq 'QUICK' -or $share.Token -eq 'CHAT') { $rank = 2 }
         elseif ($share.Token -ne 'OPEN') { $rank = 3 }
         $prev = $best[$share.IP]
         if (-not $prev -or $rank -ge $prev.Rank) {
@@ -2055,6 +2296,10 @@ function Show-CheckConnection {
         elseif ($share.Token -eq 'QUICK') {
             $tcp = Test-TcpOpen $share.IP $share.Port
             Write-Host ("  {0}:{1}  ping {2}  quick receive {3}" -f $share.IP, $share.Port, (Format-Check $ping), (Format-Check $tcp))
+        }
+        elseif ($share.Token -eq 'CHAT') {
+            $tcp = Test-TcpOpen $share.IP $share.Port
+            Write-Host ("  {0}:{1}  ping {2}  auto chat {3}" -f $share.IP, $share.Port, (Format-Check $ping), (Format-Check $tcp))
         }
         else {
             $tcp = Test-TcpOpen $share.IP $share.Port
@@ -2186,7 +2431,7 @@ function Show-ReceiveFiles {
     Write-Host ''
     Write-Host 'Looking for a PC that is sending...'
     $shares = @(Receive-Beacons -Seconds 5 | Where-Object {
-        $_.Token -ne 'OPEN' -and $_.Token -ne 'QUICK' -and $_.Port -gt 0 -and -not (Test-OwnAddress $_.IP)
+        $_.Token -ne 'OPEN' -and $_.Token -ne 'QUICK' -and $_.Token -ne 'CHAT' -and $_.Port -gt 0 -and -not (Test-OwnAddress $_.IP)
     })
     if ($shares.Count -eq 0) {
         Write-Host 'Nobody is sending right now. Start Send on the other PC, then try again.' -ForegroundColor Yellow
@@ -2234,28 +2479,620 @@ function Show-ReceiveFiles {
     }
 }
 
+function Get-ChatFlagPath { Join-Path (Get-SlipRoot) 'chat.txt' }
+function Get-ChatDir { Join-Path (Get-SlipRoot) 'Chat' }
+function Get-ChatLogPath { Join-Path (Get-ChatDir) 'chat.log' }
+function Get-ChatPidPath { Join-Path (Get-SlipCommandDir) 'chat.pid' }
+function Get-ChatPortPath { Join-Path (Get-SlipCommandDir) 'chat.port' }
+function Get-ChatRunName { "$($script:AppName)AutoChat" }
+
+function Get-SlipLaunchPath {
+    if ($PSCommandPath -and (Test-Path -LiteralPath $PSCommandPath)) { return $PSCommandPath }
+    return (Get-InstalledScriptPath)
+}
+
+function Test-AutoChat {
+    $path = Get-ChatFlagPath
+    if (-not (Test-Path -LiteralPath $path)) { return $true }
+    $raw = Get-Content -LiteralPath $path -Raw -ErrorAction SilentlyContinue
+    if ($raw -match 'off') { return $false }
+    return $true
+}
+
+function Set-AutoChatFlag {
+    param([bool]$On)
+    Ensure-SlipFiles | Out-Null
+    $value = if ($On) { 'on' } else { 'off' }
+    Set-Content -LiteralPath (Get-ChatFlagPath) -Value $value -Encoding ASCII
+}
+
+function Protect-ChatText {
+    param([string]$Text)
+    Add-Type -AssemblyName System.Security
+    $bytes = [Text.Encoding]::UTF8.GetBytes($Text)
+    $protected = [Security.Cryptography.ProtectedData]::Protect($bytes, $null, [Security.Cryptography.DataProtectionScope]::CurrentUser)
+    return [Convert]::ToBase64String($protected)
+}
+
+function Unprotect-ChatText {
+    param([string]$Stored)
+    Add-Type -AssemblyName System.Security
+    $bytes = [Convert]::FromBase64String($Stored.Trim())
+    $plain = [Security.Cryptography.ProtectedData]::Unprotect($bytes, $null, [Security.Cryptography.DataProtectionScope]::CurrentUser)
+    return [Text.Encoding]::UTF8.GetString($plain)
+}
+
+function Write-ChatLog {
+    param([string]$Room, [string]$Kind, [string]$Name, [string]$Text)
+    $dir = Get-ChatDir
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    $line = '{0}|{1}|{2}|{3}|{4}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Room, $Kind, ($Name -replace '\|', '/'), (($Text -replace '[\r\n]+', ' '))
+    Add-Content -LiteralPath (Get-ChatLogPath) -Value (Protect-ChatText $line) -Encoding ASCII
+}
+
+function Show-ChatLog {
+    Clear-Host
+    Write-Host 'Chat log' -ForegroundColor Cyan
+    Write-Host ("Version {0}" -f $script:Version) -ForegroundColor DarkGray
+    Write-Host ''
+    $path = Get-ChatLogPath
+    if (-not (Test-Path -LiteralPath $path)) {
+        Write-Host 'No chat log yet.' -ForegroundColor Yellow
+        Wait-Enter
+        return
+    }
+    $shown = 0
+    foreach ($stored in @(Get-Content -LiteralPath $path -ErrorAction SilentlyContinue)) {
+        if ([string]::IsNullOrWhiteSpace($stored)) { continue }
+        try { $line = Unprotect-ChatText $stored } catch { continue }
+        $parts = $line.Split('|')
+        if ($parts.Length -lt 5) { continue }
+        $when = $parts[0]
+        $kind = $parts[2]
+        $who = $parts[3]
+        $text = ($parts[4..($parts.Length - 1)] -join '|')
+        switch ($kind) {
+            'msg' { Write-Host ("{0}  {1}: {2}" -f $when, $who, $text) }
+            'joined' { Write-Host ("{0}  {1} joined" -f $when, $who) -ForegroundColor DarkGray }
+            'left' { Write-Host ("{0}  {1} left" -f $when, $who) -ForegroundColor DarkGray }
+            'closed' { Write-Host ("{0}  chat closed" -f $when) -ForegroundColor DarkGray }
+        }
+        $shown++
+    }
+    if ($shown -eq 0) { Write-Host 'The chat log could not be read on this Windows user.' -ForegroundColor Yellow }
+    Wait-Enter
+}
+
+function Format-ChatNotice {
+    param([string]$Kind, [string]$Name)
+    switch ($Kind) {
+        'joined' { return "$Name joined" }
+        'left' { return "$Name left" }
+        'closed' { return 'chat closed' }
+        default { return $Kind }
+    }
+}
+
+function Send-ChatWire {
+    param($Stream, [string]$Line)
+    $bytes = [Text.Encoding]::UTF8.GetBytes($Line + "`n")
+    $Stream.Write($bytes, 0, $bytes.Length)
+    $Stream.Flush()
+}
+
+function Receive-ChatWire {
+    param($Member)
+    $found = @()
+    $stream = $Member.Stream
+    if (-not $stream.DataAvailable) { return $found }
+    $buf = New-Object byte[] 4096
+    while ($stream.DataAvailable) {
+        $n = $stream.Read($buf, 0, $buf.Length)
+        if ($n -le 0) { break }
+        $Member.Pending += [Text.Encoding]::UTF8.GetString($buf, 0, $n)
+    }
+    while ($Member.Pending.Contains("`n")) {
+        $cut = $Member.Pending.IndexOf("`n")
+        $line = $Member.Pending.Substring(0, $cut).TrimEnd("`r")
+        $Member.Pending = $Member.Pending.Substring($cut + 1)
+        if ($line) { $found += $line }
+    }
+    return $found
+}
+
+function Start-ChatPopup {
+    param([string]$Room, [string]$Address, [int]$Port, [string]$FromName, [string]$Text)
+    $scriptPath = Get-SlipLaunchPath
+    $payload = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Text))
+    $from = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($FromName))
+    $arg = "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`" chatjoin -Room $Room -Address $Address -Port $Port -PeerName $from -OpeningB64 $payload"
+    Start-Process -FilePath powershell.exe -ArgumentList $arg | Out-Null
+}
+
+function Enable-AutoChat {
+    param([switch]$Quiet)
+    Set-AutoChatFlag $true
+    Install-SlipCommand
+    $scriptPath = Get-InstalledScriptPath
+    $value = "`"powershell.exe`" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`" chatlisten"
+    $runPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+    try {
+        if (-not (Test-Path -LiteralPath $runPath)) { New-Item -Path $runPath -Force | Out-Null }
+        New-ItemProperty -LiteralPath $runPath -Name (Get-ChatRunName) -Value $value -PropertyType String -Force | Out-Null
+    } catch { }
+    $alive = $false
+    if (Test-Path -LiteralPath (Get-ChatPidPath)) {
+        $chatPid = 0
+        if ([int]::TryParse((Get-Content -LiteralPath (Get-ChatPidPath) -Raw -ErrorAction SilentlyContinue).Trim(), [ref]$chatPid)) {
+            $alive = $null -ne (Get-Process -Id $chatPid -ErrorAction SilentlyContinue)
+        }
+    }
+    if (-not $alive) {
+        $arg = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`" chatlisten"
+        Start-Process -FilePath powershell.exe -ArgumentList $arg -WindowStyle Hidden | Out-Null
+    }
+    if (-not $Quiet) {
+        Write-Host 'Auto chat is on. A message from another PC opens a chat window.' -ForegroundColor Green
+        Read-Host 'Press Enter'
+    }
+}
+
+function Stop-AutoChat {
+    $flag = Get-ChatFlagPath
+    if (Test-Path -LiteralPath (Get-SlipRoot)) {
+        if (Test-Path -LiteralPath $flag) { Set-Content -LiteralPath $flag -Value 'off' -Encoding ASCII }
+    }
+    if (Test-Path -LiteralPath (Get-ChatPidPath)) {
+        $chatPid = 0
+        if ([int]::TryParse((Get-Content -LiteralPath (Get-ChatPidPath) -Raw -ErrorAction SilentlyContinue).Trim(), [ref]$chatPid)) {
+            Stop-Process -Id $chatPid -Force -ErrorAction SilentlyContinue
+        }
+        Remove-Item -LiteralPath (Get-ChatPidPath) -Force -ErrorAction SilentlyContinue
+    }
+    Remove-Item -LiteralPath (Get-ChatPortPath) -Force -ErrorAction SilentlyContinue
+    try {
+        Remove-ItemProperty -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name (Get-ChatRunName) -ErrorAction SilentlyContinue
+    } catch { }
+}
+
+function Set-AutoChat {
+    param([bool]$On)
+    if ($On) { Enable-AutoChat }
+    else {
+        Stop-AutoChat
+        Write-Host 'Auto chat is off.' -ForegroundColor Green
+        Read-Host 'Press Enter'
+    }
+}
+
+function Ensure-AutoChat {
+    if (-not (Test-AutoChat)) { return }
+    if (-not (Test-SlipInstalled)) { return }
+    Enable-AutoChat -Quiet
+}
+
+function Start-ChatListener {
+    $root = Get-SlipRoot
+    if (-not (Test-Path -LiteralPath $root)) { return }
+    $flag = Get-ChatFlagPath
+    $pidFile = Get-ChatPidPath
+    $portFile = Get-ChatPortPath
+    $dir = Split-Path -Parent $pidFile
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    Set-Content -LiteralPath $pidFile -Value $PID -Encoding ASCII
+    $listener = New-SlipTcpListener
+    $port = ([Net.IPEndPoint]$listener.LocalEndpoint).Port
+    Set-Content -LiteralPath $portFile -Value $port -Encoding ASCII
+    try {
+        while ((Get-Content -LiteralPath $flag -Raw -ErrorAction SilentlyContinue) -notmatch 'off') {
+            $name = Get-DisplayName
+            $payload = '{0}|CHAT|{1}|{2}|{3}|0|chat' -f $script:BeaconPrefix, $port, (ConvertTo-BeaconField $name), (ConvertTo-BeaconField $env:COMPUTERNAME)
+            try { [void](Send-BeaconPayload -Payload $payload -Port $script:BeaconPort) } catch { }
+            if (-not $listener.Pending()) {
+                Start-Sleep -Milliseconds 200
+                continue
+            }
+            $client = $listener.AcceptTcpClient()
+            try {
+                $stream = $client.GetStream()
+                $stream.ReadTimeout = 5000
+                $reader = New-Object IO.StreamReader($stream, [Text.Encoding]::UTF8, $false, 1024, $true)
+                $line = $reader.ReadLine()
+                if ($line -and $line.StartsWith('INVITE|')) {
+                    $parts = $line.Split('|')
+                    if ($parts.Length -ge 5) {
+                        $room = $parts[1]
+                        $hostPort = 0
+                        [void][int]::TryParse($parts[2], [ref]$hostPort)
+                        $from = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($parts[3]))
+                        $text = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($parts[4]))
+                $hostIp = $client.Client.RemoteEndPoint.Address.ToString()
+                        if ($hostPort -gt 0 -and $text) {
+                            Start-ChatPopup -Room $room -Address $hostIp -Port $hostPort -FromName $from -Text $text
+                            $ack = [Text.Encoding]::ASCII.GetBytes("OK`n")
+                            $stream.Write($ack, 0, $ack.Length)
+                        }
+                    }
+                }
+            } catch { }
+            finally { try { $client.Close() } catch { } }
+        }
+    }
+    finally {
+        $listener.Stop()
+        Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $portFile -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Show-ChatSession {
+    param(
+        [string]$Room,
+        [string]$Title,
+        $Listener,
+        $Stream,
+        [string]$OpeningFrom,
+        [string]$OpeningText,
+        [switch]$IsHost
+    )
+    $me = Get-DisplayName
+    $members = @()
+    $closed = $false
+    $draft = ''
+    Clear-Host
+    Write-Host 'Chat' -ForegroundColor Cyan
+    Write-Host ("Version {0}    {1}" -f $script:Version, $Title) -ForegroundColor DarkGray
+    Write-Host ''
+    if ($OpeningText) {
+        Write-Host ("{0}: {1}" -f $OpeningFrom, $OpeningText)
+        Write-ChatLog -Room $Room -Kind 'msg' -Name $OpeningFrom -Text $OpeningText
+    }
+    Write-Host 'Type a message and press Enter. Esc closes the chat.' -ForegroundColor DarkGray
+    Write-Host ''
+
+    function Write-ChatNotice([string]$Kind, [string]$Name) {
+        Write-Host ''
+        Write-Host (Format-ChatNotice $Kind $Name) -ForegroundColor DarkGray
+        Write-ChatLog -Room $Room -Kind $Kind -Name $Name -Text ''
+    }
+    function Broadcast-Chat([string]$Line, $Except) {
+        foreach ($member in @($members)) {
+            if ($Except -and ($member -eq $Except)) { continue }
+            try { Send-ChatWire -Stream $member.Stream -Line $Line } catch { }
+        }
+    }
+
+    $solo = @{ Stream = $Stream; Pending = '' }
+    if (-not $IsHost -and $Stream) {
+        try {
+            Send-ChatWire -Stream $Stream -Line ("HELLO|{0}" -f [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($me)))
+        } catch {
+            Write-Host 'chat closed' -ForegroundColor DarkGray
+            return
+        }
+    }
+
+    while (-not $closed) {
+        if ($IsHost -and $Listener -and $Listener.Pending()) {
+            $incoming = $Listener.AcceptTcpClient()
+            $member = @{ Client = $incoming; Stream = $incoming.GetStream(); Name = 'Guest'; Pending = '' }
+            $hello = ''
+            $deadline = (Get-Date).AddSeconds(3)
+            while (-not $hello -and (Get-Date) -lt $deadline) {
+                foreach ($line in @(Receive-ChatWire $member)) { $hello = $line; break }
+                if (-not $hello) { Start-Sleep -Milliseconds 50 }
+            }
+            if ($hello -like 'HELLO|*') {
+                try { $member.Name = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($hello.Substring(6))) } catch { }
+            }
+            $members += $member
+            Write-ChatNotice 'joined' $member.Name
+            Broadcast-Chat ("SYS|joined|{0}" -f $member.Name)
+        }
+        $drop = @()
+        foreach ($member in @($members)) {
+            try {
+                foreach ($line in @(Receive-ChatWire $member)) {
+                    if ($line -eq 'BYE') { $drop += $member; continue }
+                    if ($line.StartsWith('MSG|')) {
+                        $text = ''
+                        try { $text = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($line.Substring(4))) } catch { continue }
+                        Write-Host ''
+                        Write-Host ("{0}: {1}" -f $member.Name, $text)
+                        Write-ChatLog -Room $Room -Kind 'msg' -Name $member.Name -Text $text
+                        Broadcast-Chat ("MSG|{0}|{1}" -f $member.Name, $line.Substring(4)) $member
+                    }
+                }
+            } catch { $drop += $member }
+        }
+        foreach ($member in @($drop)) {
+            Write-ChatNotice 'left' $member.Name
+            Broadcast-Chat ("SYS|left|{0}" -f $member.Name)
+            try { $member.Client.Close() } catch { }
+            $members = @($members | Where-Object { $_ -ne $member })
+        }
+        if (-not $IsHost -and $Stream) {
+            try {
+                foreach ($line in @(Receive-ChatWire $solo)) {
+                    if ($line.StartsWith('SYS|')) {
+                        $bits = $line.Split('|')
+                        $kind = $bits[1]
+                        $who = if ($bits.Length -gt 2) { $bits[2] } else { '' }
+                        Write-ChatNotice $kind $who
+                        if ($kind -eq 'closed') { $closed = $true }
+                    }
+                    elseif ($line.StartsWith('MSG|')) {
+                        $bits = $line.Split('|')
+                        $text = ''
+                        try { $text = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($bits[2])) } catch { continue }
+                        Write-Host ''
+                        Write-Host ("{0}: {1}" -f $bits[1], $text)
+                        Write-ChatLog -Room $Room -Kind 'msg' -Name $bits[1] -Text $text
+                    }
+                }
+            } catch {
+                Write-ChatNotice 'closed' ''
+                $closed = $true
+            }
+        }
+        if ($closed) { break }
+        if (-not (Test-SlipConsoleKeys)) {
+            $typed = Read-Host '>'
+            if ($typed -eq '/quit') { $closed = $true; break }
+            if ($typed) {
+                $packed = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($typed))
+                Write-Host ("{0}: {1}" -f $me, $typed)
+                Write-ChatLog -Room $Room -Kind 'msg' -Name $me -Text $typed
+                if ($IsHost) { Broadcast-Chat ("MSG|{0}|{1}" -f $me, $packed) }
+                elseif ($Stream) { Send-ChatWire -Stream $Stream -Line ("MSG|{0}" -f $packed) }
+            }
+            continue
+        }
+        if (-not $Host.UI.RawUI.KeyAvailable) {
+            Start-Sleep -Milliseconds 40
+            continue
+        }
+        $key = Read-SlipKey
+        if ($key.Name -eq 'Escape') { $closed = $true; break }
+        if ($key.Name -eq 'Enter') {
+            $typed = $draft.Trim()
+            $draft = ''
+            Write-Host ''
+            if (-not $typed) { continue }
+            $packed = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($typed))
+            Write-Host ("{0}: {1}" -f $me, $typed)
+            Write-ChatLog -Room $Room -Kind 'msg' -Name $me -Text $typed
+            if ($IsHost) { Broadcast-Chat ("MSG|{0}|{1}" -f $me, $packed) }
+            elseif ($Stream) { Send-ChatWire -Stream $Stream -Line ("MSG|{0}" -f $packed) }
+            continue
+        }
+        if ($key.Name -eq 'Backspace') {
+            if ($draft.Length -gt 0) { $draft = $draft.Substring(0, $draft.Length - 1) }
+        }
+        elseif ($key.Char) { $draft += $key.Char }
+        Write-Host ("`r> {0} " -f $draft) -NoNewline
+    }
+    if ($IsHost) {
+        Broadcast-Chat 'SYS|closed|'
+        Write-Host ''
+        Write-Host 'chat closed' -ForegroundColor DarkGray
+        Write-ChatLog -Room $Room -Kind 'closed' -Name $me -Text ''
+        foreach ($member in @($members)) { try { $member.Client.Close() } catch { } }
+        try { $Listener.Stop() } catch { }
+    }
+    elseif ($Stream) {
+        try { Send-ChatWire -Stream $Stream -Line 'BYE' } catch { }
+        try { $Stream.Close() } catch { }
+    }
+}
+
+function Show-ChatPeople {
+    param($People)
+    $selected = @{}
+    for ($i = 0; $i -lt $People.Count; $i++) { $selected[$i] = $true }
+    $cursor = 0
+    while ($true) {
+        Clear-Host
+        Write-Host 'Chat' -ForegroundColor Cyan
+        Write-Host ("Version {0}" -f $script:Version) -ForegroundColor DarkGray
+        Write-Host ''
+        Write-Host 'Choose one PC or several. Space toggles. C continues. Q goes back.'
+        Write-Host ''
+        for ($i = 0; $i -lt $People.Count; $i++) {
+            $mark = if ($selected[$i]) { '[x]' } else { '[ ]' }
+            $line = "[{0}]  {1}  {2} ({3})" -f ($i + 1), $mark, $People[$i].Display, $People[$i].Windows
+            if ($i -eq $cursor -and (Test-SlipConsoleKeys)) { Write-Host ("  > " + $line) -ForegroundColor Green }
+            else { Write-Host ("    " + $line) }
+        }
+        $choice = Read-PickerAction
+        if ([string]::IsNullOrWhiteSpace($choice) -and -not (Test-SlipConsoleKeys)) { return $null }
+        if ($choice -eq 'UP') { if ($cursor -gt 0) { $cursor-- } else { $cursor = $People.Count - 1 }; continue }
+        if ($choice -eq 'DOWN') { if ($cursor -lt ($People.Count - 1)) { $cursor++ } else { $cursor = 0 }; continue }
+        if ($choice -eq 'TOGGLE') { $selected[$cursor] = -not $selected[$cursor]; continue }
+        if ($choice -match '^[Qq]$') { return $null }
+        if ($choice -match '^\d+$') {
+            $idx = [int]$choice - 1
+            if ($idx -ge 0 -and $idx -lt $People.Count) { $selected[$idx] = -not $selected[$idx]; $cursor = $idx }
+            continue
+        }
+        if ($choice -match '^[Cc]$') {
+            $picked = @()
+            for ($i = 0; $i -lt $People.Count; $i++) { if ($selected[$i]) { $picked += $People[$i] } }
+            if ($picked.Count -eq 0) {
+                Write-Host 'Choose at least one PC.' -ForegroundColor Yellow
+                Start-Sleep -Seconds 1
+                continue
+            }
+            return $picked
+        }
+    }
+}
+
+function Invoke-ChatInvite {
+    param($Person, [string]$Room, [int]$HostPort, [string]$Text)
+    $client = New-Object System.Net.Sockets.TcpClient
+    try {
+        $wait = $client.BeginConnect($Person.IP, [int]$Person.Port, $null, $null)
+        if (-not $wait.AsyncWaitHandle.WaitOne(4000, $false)) { return $false }
+        $client.EndConnect($wait)
+        $stream = $client.GetStream()
+        $from = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes((Get-DisplayName)))
+        $body = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Text))
+        $line = "INVITE|{0}|{1}|{2}|{3}`n" -f $Room, $HostPort, $from, $body
+        $bytes = [Text.Encoding]::ASCII.GetBytes($line)
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.ReadTimeout = 4000
+        $reader = New-Object IO.StreamReader($stream)
+        $ack = $reader.ReadLine()
+        return ($ack -eq 'OK')
+    } catch { return $false }
+    finally { try { $client.Close() } catch { } }
+}
+
+function Start-ChatWith {
+    param($People, [string]$Text)
+    $listener = New-SlipTcpListener
+    $port = ([Net.IPEndPoint]$listener.LocalEndpoint).Port
+    $room = ([guid]::NewGuid().ToString('N')).Substring(0, 8)
+    $reached = @()
+    $missed = @()
+    foreach ($person in @($People)) {
+        if (Invoke-ChatInvite -Person $person -Room $room -HostPort $port -Text $Text) { $reached += $person }
+        else { $missed += $person }
+    }
+    $names = @($reached | ForEach-Object { $_.Display })
+    $title = if ($names.Count -gt 0) { $names -join ', ' } else { 'waiting' }
+    if ($missed.Count -gt 0) {
+        Write-Host ("Could not open chat on: {0}" -f (($missed | ForEach-Object { $_.Display }) -join ', ')) -ForegroundColor Yellow
+        Start-Sleep -Seconds 1
+    }
+    Show-ChatSession -Room $room -Title $title -Listener $listener -OpeningFrom (Get-DisplayName) -OpeningText $Text -IsHost
+}
+
+function Show-StartChat {
+    Clear-Host
+    Write-Host 'Chat' -ForegroundColor Cyan
+    Write-Host ("Version {0}" -f $script:Version) -ForegroundColor DarkGray
+    Write-Host ''
+    Write-Host 'Looking for PCs with Auto chat...'
+    $mine = @(Get-LanIPv4 -IncludeVirtual)
+    $people = @()
+    try {
+        $people = @(Receive-Beacons -Seconds 3 | Where-Object {
+            $_.Token -eq 'CHAT' -and $_.Port -gt 0 -and ($mine -notcontains $_.IP)
+        })
+    } catch { $people = @() }
+    if ($people.Count -eq 0) {
+        Write-Host 'No other PC with Auto chat was found.' -ForegroundColor Yellow
+        Write-Host 'That PC needs Slip installed. Auto chat is on unless it was turned off.'
+        Wait-Enter
+        return
+    }
+    $picked = Show-ChatPeople $people
+    if (-not $picked) { return }
+    $text = Read-Host 'Message'
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        Write-Host 'Type a message to open the chat.' -ForegroundColor Yellow
+        Wait-Enter
+        return
+    }
+    Start-ChatWith -People $picked -Text $text.Trim()
+}
+
+function Show-FoldersMenu {
+    while ($true) {
+        $pick = Read-ArrowMenu -Title 'Folders' -Lines @('Outbox is what you send. Inbox is what you receive.') -Items @(
+            'Open Outbox',
+            'Open Inbox'
+        ) -ZeroLabel 'Back'
+        switch ($pick) {
+            0 { Open-Folder (Get-OutboxPath) }
+            1 { Open-Folder (Get-InboxPath) }
+            default { return }
+        }
+    }
+}
+
+function Show-UpgradeScreen {
+    Clear-Host
+    Write-Host 'Upgrade' -ForegroundColor Cyan
+    Write-Host ("Version {0}" -f $script:Version) -ForegroundColor DarkGray
+    Write-Host ''
+    Write-Host 'Upgrade downloads the current Slip script and refreshes this PC.'
+    Write-Host 'Outbox, Inbox, chat logs, and the display name stay.' -ForegroundColor Green
+    Write-Host ''
+    $answer = Read-Host '[Y] Upgrade  [N] Back'
+    if ($answer -notmatch '^[Yy]') { return }
+    $payload = Join-Path $env:TEMP 'slip-upgrade.ps1'
+    Write-Host ''
+    try {
+        Invoke-RestMethod -Uri $script:SourceUrl -OutFile $payload -ErrorAction Stop
+        $quick = if (Test-QuickReceive) { '-QuickReceive' } else { '' }
+        $arg = "-NoProfile -ExecutionPolicy Bypass -File `"$payload`" upgrade $quick -Quiet".Trim()
+        $proc = Start-Process -FilePath powershell.exe -ArgumentList $arg -Wait -PassThru -WindowStyle Hidden
+        if ($proc.ExitCode -eq 0) { Write-Host 'Upgrade finished.' -ForegroundColor Green }
+        else { Write-Host "Upgrade stopped (exit $($proc.ExitCode))." -ForegroundColor Yellow }
+    } catch {
+        Write-Host $_.Exception.Message -ForegroundColor Red
+    } finally {
+        Remove-Item -LiteralPath $payload -Force -ErrorAction SilentlyContinue
+    }
+    Wait-Enter
+}
+
+function Show-DiagnosticsMenu {
+    while ($true) {
+        $active = @(Get-ActiveNetworkProfiles)
+        $public = @(Get-PublicNetworkProfiles)
+        $netLabel = 'Network: Private'
+        if ($active.Count -eq 0) { $netLabel = 'Network: not connected' }
+        elseif ($public.Count -gt 0) { $netLabel = "Network: $($public[0].NetworkCategory), make Private" }
+        $pick = Read-ArrowMenu -Title 'Diagnostics' -Lines @('Repair, upgrade, and logs. Everyday send and receive stay on the main menu.') -Items @(
+            'Status',
+            'Repair',
+            'Upgrade',
+            'Remove',
+            'Rename this PC',
+            $netLabel,
+            'Open Debug folder',
+            'Chat log'
+        ) -ZeroLabel 'Back'
+        switch ($pick) {
+            0 { Show-Status }
+            1 { Show-RepairScreen }
+            2 { Show-UpgradeScreen }
+            3 { Invoke-RemoveSlip }
+            4 { Rename-ThisPc }
+            5 {
+                Clear-Host
+                Write-Host 'Network type' -ForegroundColor Cyan
+                [void](Invoke-MakeNetworkPrivate)
+                Wait-Enter
+            }
+            6 { Open-DebugFolder }
+            7 { Show-ChatLog }
+            default { return }
+        }
+    }
+}
+
 function Show-MoreMenu {
     while ($true) {
         $quickLabel = if (Test-QuickReceive) { 'Quick receive: On' } else { 'Quick receive: Off' }
-        $pick = Read-ArrowMenu -Title 'More' -Items @(
+        $chatLabel = if (Test-AutoChat) { 'Auto chat: On' } else { 'Auto chat: Off' }
+        $pick = Read-ArrowMenu -Title 'More' -Lines @('How-to and connection. Repair and logs are under Diagnostics.') -Items @(
             'How to send and receive',
-            'Status',
-            'Repair',
-            'Remove',
-            'Rename this PC',
             'Check connection',
-            'Open Debug folder',
-            $quickLabel
+            $quickLabel,
+            $chatLabel,
+            'Diagnostics'
         ) -ZeroLabel 'Back'
         switch ($pick) {
             0 { Show-HowTo }
-            1 { Show-Status }
-            2 { Show-RepairScreen }
-            3 { Invoke-RemoveSlip }
-            4 { Rename-ThisPc }
-            5 { Show-CheckConnection }
-            6 { Open-DebugFolder }
-            7 { Set-QuickReceive -On (-not (Test-QuickReceive)) }
+            1 { Show-CheckConnection }
+            2 { Set-QuickReceive -On (-not (Test-QuickReceive)) }
+            3 { Set-AutoChat -On (-not (Test-AutoChat)) }
+            4 { Show-DiagnosticsMenu }
             default { return }
         }
     }
@@ -2265,27 +3102,30 @@ function Show-SlipMenu {
     param([switch]$CanReturn)
     $loop = $null
     try {
+        Ensure-AutoChat
         $loop = Start-PresenceLoop
         while ($true) {
             $ips = @(Get-LanIPv4)
             $ipText = if ($ips.Count -gt 0) { $ips[0] } else { 'no LAN address' }
             $outCount = @(Get-OutboxItems).Count
+            $chatState = if (Test-AutoChat) { 'Auto chat on' } else { 'Auto chat off' }
             $zero = if ($CanReturn) { 'Back' } else { 'Quit' }
             $pick = Read-ArrowMenu -Title $script:AppName -Lines @(
-                ("Shown as: {0}    {1}" -f (Get-DisplayName), $ipText),
-                "Outbox: $outCount files"
+                ("{0}    {1}" -f (Get-DisplayName), $ipText),
+                ("Outbox {0}    {1}" -f $outCount, $chatState),
+                '----------------------------------------'
             ) -Items @(
                 'Send files',
                 'Receive files',
-                'Open Outbox',
-                'Open Inbox',
+                'Chat',
+                'Folders',
                 'More'
             ) -ZeroLabel $zero
             switch ($pick) {
                 0 { Show-SendFiles }
                 1 { Show-ReceiveFiles }
-                2 { Open-Folder (Get-OutboxPath) }
-                3 { Open-Folder (Get-InboxPath) }
+                2 { Show-StartChat }
+                3 { Show-FoldersMenu }
                 4 { Show-MoreMenu }
                 default { return }
             }
@@ -2383,7 +3223,8 @@ function Show-Launcher {
         $second = if (Test-SlipInstalled) { "Open $($script:AppName)" } else { "Get $($script:AppName)" }
         $pick = Read-ArrowMenu -Title 'everlasting-dev' -Lines @(
             "This PC: $env:COMPUTERNAME",
-            $status
+            $status,
+            ("Slip {0}" -f $script:Version)
         ) -Items @(
             'Get Octane',
             $second,
@@ -2411,7 +3252,11 @@ function Get-EntryOptions {
         ReadyFile = $null
         DisplayName = $null
         QuickReceive = $false
+        MakeNetworkPrivate = $false
         Quiet = $false
+        Room = $null
+        PeerName = $null
+        OpeningB64 = $null
         Paths = @()
     }
     if ($env:SLIP_ENTRY) { $o.Entry = $env:SLIP_ENTRY }
@@ -2423,9 +3268,12 @@ function Get-EntryOptions {
         if ($token -eq 'menu') { $o.Entry = 'menu' }
         elseif ($token -eq 'firewall') { $o.Entry = 'firewall' }
         elseif ($token -eq 'unfirewall') { $o.Entry = 'unfirewall' }
+        elseif ($token -eq 'netprivate') { $o.Entry = 'netprivate' }
         elseif ($token -eq 'serve') { $o.Entry = 'serve' }
         elseif ($token -eq 'recv') { $o.Entry = 'recv' }
         elseif ($token -eq 'listen') { $o.Entry = 'listen' }
+        elseif ($token -eq 'chatlisten') { $o.Entry = 'chatlisten' }
+        elseif ($token -eq 'chatjoin') { $o.Entry = 'chatjoin' }
         elseif ($token -eq 'install' -or $token -eq 'setup') { $o.Entry = 'install' }
         elseif ($token -eq 'upgrade' -or $token -eq 'update' -or $token -eq 'migrate' -or $token -eq 'repair') { $o.Entry = 'upgrade' }
         elseif ($token -eq '-Address' -and ($i + 1) -lt $pending.Count) { $i++; $o.Address = [string]$pending[$i] }
@@ -2436,7 +3284,11 @@ function Get-EntryOptions {
         elseif ($token -eq '-ReadyFile' -and ($i + 1) -lt $pending.Count) { $i++; $o.ReadyFile = [string]$pending[$i] }
         elseif ($token -eq '-DisplayName' -and ($i + 1) -lt $pending.Count) { $i++; $o.DisplayName = [string]$pending[$i] }
         elseif ($token -eq '-QuickReceive' -or $token -eq '-EnableQuickReceive' -or $token -eq '-AutoReceive') { $o.QuickReceive = $true }
+        elseif ($token -eq '-MakeNetworkPrivate' -or $token -eq '-PrivateNetwork') { $o.MakeNetworkPrivate = $true }
         elseif ($token -eq '-Quiet' -or $token -eq '-Silent' -or $token -eq '/quiet' -or $token -eq '/silent') { $o.Quiet = $true }
+        elseif ($token -eq '-Room' -and ($i + 1) -lt $pending.Count) { $i++; $o.Room = [string]$pending[$i] }
+        elseif ($token -eq '-PeerName' -and ($i + 1) -lt $pending.Count) { $i++; $o.PeerName = [string]$pending[$i] }
+        elseif ($token -eq '-OpeningB64' -and ($i + 1) -lt $pending.Count) { $i++; $o.OpeningB64 = [string]$pending[$i] }
         elseif ($token -like '-*') { }
         else { $paths += $token }
         $i++
@@ -2454,7 +3306,7 @@ $script:Opt = Get-EntryOptions
 switch ($script:Opt.Entry) {
     'install' {
         try {
-            if (Invoke-UnattendedInstall -DisplayName $script:Opt.DisplayName -QuickReceive:$script:Opt.QuickReceive -Quiet:$script:Opt.Quiet) {
+            if (Invoke-UnattendedInstall -DisplayName $script:Opt.DisplayName -QuickReceive:$script:Opt.QuickReceive -Quiet:$script:Opt.Quiet -MakeNetworkPrivate:$script:Opt.MakeNetworkPrivate) {
                 Exit-Slip 0
             } else {
                 Exit-Slip 1
@@ -2468,7 +3320,7 @@ switch ($script:Opt.Entry) {
     }
     'upgrade' {
         try {
-            if (Invoke-UnattendedUpgrade -DisplayName $script:Opt.DisplayName -QuickReceive:$script:Opt.QuickReceive -Quiet:$script:Opt.Quiet) {
+            if (Invoke-UnattendedUpgrade -DisplayName $script:Opt.DisplayName -QuickReceive:$script:Opt.QuickReceive -Quiet:$script:Opt.Quiet -MakeNetworkPrivate:$script:Opt.MakeNetworkPrivate) {
                 Exit-Slip 0
             } else {
                 Exit-Slip 1
@@ -2494,6 +3346,15 @@ switch ($script:Opt.Entry) {
         try {
             Uninstall-FirewallRules
             Exit-Slip 0
+        } catch {
+            Write-Host $_.Exception.Message -ForegroundColor Red
+            Exit-Slip 1
+        }
+    }
+    'netprivate' {
+        try {
+            [void](Set-ActiveNetworksPrivate)
+            if (@(Get-PublicNetworkProfiles).Count -eq 0) { Exit-Slip 0 } else { Exit-Slip 1 }
         } catch {
             Write-Host $_.Exception.Message -ForegroundColor Red
             Exit-Slip 1
@@ -2536,6 +3397,32 @@ switch ($script:Opt.Entry) {
             Exit-Slip 0
         } catch {
             [Console]::Error.WriteLine($_.Exception.Message)
+            Exit-Slip 1
+        }
+    }
+    'chatlisten' {
+        try {
+            Start-ChatListener
+            Exit-Slip 0
+        } catch {
+            [Console]::Error.WriteLine($_.Exception.Message)
+            Exit-Slip 1
+        }
+    }
+    'chatjoin' {
+        try {
+            $from = ''
+            $text = ''
+            if ($script:Opt.PeerName) { $from = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($script:Opt.PeerName)) }
+            if ($script:Opt.OpeningB64) { $text = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($script:Opt.OpeningB64)) }
+            $client = New-Object System.Net.Sockets.TcpClient
+            $wait = $client.BeginConnect($script:Opt.Address, [int]$script:Opt.Port, $null, $null)
+            if (-not $wait.AsyncWaitHandle.WaitOne(5000, $false)) { throw 'chat closed' }
+            $client.EndConnect($wait)
+            Show-ChatSession -Room $script:Opt.Room -Title $from -Stream $client.GetStream() -OpeningFrom $from -OpeningText $text
+            Exit-Slip 0
+        } catch {
+            Write-Host 'chat closed' -ForegroundColor DarkGray
             Exit-Slip 1
         }
     }
