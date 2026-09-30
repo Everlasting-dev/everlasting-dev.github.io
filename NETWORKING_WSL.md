@@ -6,7 +6,7 @@ WSL 2, Hyper-V, Docker, VMware, VirtualBox, and some Wi-Fi Direct features creat
 
 That address is real on the local machine, but it is not the normal Wi-Fi or Ethernet address that another PC on the room LAN can reach. If Slip advertises that virtual address, another PC tries to connect to a network that only exists inside this machine, so discovery or transfer appears broken.
 
-Slip 1.3.4 filters these virtual adapters out when choosing the LAN address and when broadcasting presence. The Check connection screen still lists ignored virtual addresses so you can see what Windows reported.
+Slip 1.3.5 filters these virtual adapters out when choosing the LAN address and when broadcasting presence. The Check connection screen still lists ignored virtual addresses so you can see what Windows reported.
 
 ## What to use instead
 

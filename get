@@ -12,7 +12,7 @@ $script:RawArgs = @($args)
 $script:RuleTcp = "$($script:AppName) TCP"
 $script:RuleUdp = "$($script:AppName) Discovery"
 $script:BeaconPrefix = $script:AppName.ToUpperInvariant() + '1'
-$script:Version = '1.3.4'
+$script:Version = '1.3.5'
 
 function Initialize-SlipSecurityProtocol {
     try {
@@ -743,6 +743,7 @@ function Invoke-UnattendedUpgrade {
     if (-not $Quiet) {
         Write-Host "Updating $($script:AppName)..." -ForegroundColor Cyan
     }
+    Write-SlipLog "Upgrade applying fetched payload. version=$($script:Version) source=$($script:SourceUrl)."
     $quickShouldRun = $QuickReceive -or (Test-QuickReceive)
     Stop-QuickReceive
     Stop-AutoChat
@@ -3482,6 +3483,14 @@ switch ($script:Opt.Entry) {
                 $payload = Join-Path $env:TEMP 'slip-upgrade.ps1'
                 Remove-Item -LiteralPath $payload -Force -ErrorAction SilentlyContinue
                 Invoke-RestMethod -Uri $script:SourceUrl -OutFile $payload -ErrorAction Stop
+                $payloadVersion = 'unknown'
+                $payloadBytes = 0
+                try {
+                    $payloadBytes = (Get-Item -LiteralPath $payload -ErrorAction Stop).Length
+                    $match = [regex]::Match([IO.File]::ReadAllText($payload), "\`$script:Version\s*=\s*'([^']+)'")
+                    if ($match.Success) { $payloadVersion = $match.Groups[1].Value }
+                } catch { }
+                Write-SlipLog "Upgrade downloaded online payload. source=$($script:SourceUrl) version=$payloadVersion bytes=$payloadBytes."
                 $forward = @('upgrade')
                 if ($script:Opt.DisplayName) { $forward += @('-DisplayName', $script:Opt.DisplayName) }
                 if ($script:Opt.QuickReceive) { $forward += '-QuickReceive' }

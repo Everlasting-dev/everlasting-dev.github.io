@@ -3,6 +3,13 @@
 Internal handoff log for Cursor agents and plugins. Newest entries first.
 Read before editing; append after substantive changes.
 
+## 2026-09-30 - Slip 1.3.5 visible online upgrade check
+
+- **Why:** A laptop test made it look like `slip upgrade` was rerunning the local saved script, because the live script had been changed without a visible version bump.
+- **Changes:** Version 1.3.5. `slip upgrade` still downloads `https://everlasting-dev.github.io/get` first on any PC that has the 1.3.2+ launcher/profile, and the upgrade path now writes explicit debug lines for `Upgrade downloaded online payload` and `Upgrade applying fetched payload` with the payload version and byte count. Docs now call out that pre-1.3.2 laptops need the one-time online bootstrap before plain `slip upgrade` can self-update.
+- **Files:** `lanfile.ps1`, `UI.md`, `NETWORKING_WSL.md`, `AGENT_CHANGELOG.md`
+- **Notes:** If a laptop still has an older local-only `slip` launcher, it cannot learn the new online behavior by running that same old local launcher. Run the online bootstrap command once; after the menu shows 1.3.5, future `slip upgrade` calls fetch online first.
+
 ## 2026-09-30 - Slip 1.3.4 upgrade and chat polish
 
 - **Why:** The old upgrade wrappers could leave stale files behind, background listeners could hold the installed host script during upgrade, chat invites felt delayed, and chat failures were hard to diagnose from the debug folder.
