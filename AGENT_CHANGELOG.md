@@ -3,6 +3,12 @@
 Internal handoff log for Cursor agents and plugins. Newest entries first.
 Read before editing; append after substantive changes.
 
+## 2026-09-30 - slip upgrade downloads the latest script
+
+- **Why:** `slip upgrade` should fetch the published script instead of reapplying the copy already on the PC
+- **Changes:** replaced `get` with version 1.3.1. Command Prompt `slip upgrade` downloads this file and turns Auto chat on.
+- **Files:** `get`, `AGENT_CHANGELOG.md`
+
 ## 2026-09-30 - shorter menus, version 1.3.0, auto chat
 
 - **Why:** the published `get` script should match the local Slip menu and the auto chat listener

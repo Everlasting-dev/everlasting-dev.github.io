@@ -12,7 +12,7 @@ $script:RawArgs = @($args)
 $script:RuleTcp = "$($script:AppName) TCP"
 $script:RuleUdp = "$($script:AppName) Discovery"
 $script:BeaconPrefix = $script:AppName.ToUpperInvariant() + '1'
-$script:Version = '1.3.0'
+$script:Version = '1.3.1'
 
 function Initialize-SlipSecurityProtocol {
     try {
@@ -337,8 +337,27 @@ function Get-SlipFunctionBlock {
 # >>> $($script:CommandName) >>>
 function $($script:CommandName) {
     `$local = '$installedScript'
+    `$cmd = if (`$args.Count -gt 0) { [string]`$args[0] } else { '' }
+    if (`$cmd -match '^(?i:upgrade|update|migrate)$') {
+        `$tmp = Join-Path `$env:TEMP '$($script:CommandName)-upgrade.ps1'
+        Remove-Item -LiteralPath `$tmp -Force -ErrorAction SilentlyContinue
+        try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
+        Invoke-RestMethod -Uri '$($script:SourceUrl)' -OutFile `$tmp -ErrorAction Stop
+        `$env:SLIP_FETCHED_UPGRADE = '1'
+        try {
+            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File `$tmp upgrade @(`$args | Select-Object -Skip 1)
+            return
+        } finally {
+            Remove-Item Env:SLIP_FETCHED_UPGRADE -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath `$tmp -Force -ErrorAction SilentlyContinue
+        }
+    }
     if (Test-Path -LiteralPath `$local) {
-        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File `$local menu @args
+        if (`$args.Count -eq 0) {
+            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File `$local menu
+        } else {
+            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File `$local @args
+        }
         return
     }
     `$tmp = Join-Path `$env:TEMP '$($script:CommandName)-get.ps1'
@@ -347,7 +366,11 @@ function $($script:CommandName) {
     Invoke-RestMethod -Uri '$($script:SourceUrl)' -OutFile `$tmp -ErrorAction Stop
     if (-not (Test-Path -LiteralPath `$tmp)) { throw 'Could not download $($script:AppName).' }
     try {
-        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File `$tmp menu @args
+        if (`$args.Count -eq 0) {
+            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File `$tmp menu
+        } else {
+            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File `$tmp @args
+        }
     } finally {
         Remove-Item -LiteralPath `$tmp -Force -ErrorAction SilentlyContinue
     }
@@ -413,8 +436,25 @@ function Install-SlipCommand {
     $installedScript = Get-InstalledScriptPath
     $menuCmd = @"
 @echo off
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$installedScript" menu %*
+setlocal
+if /I "%~1"=="upgrade" goto slipfetch
+if /I "%~1"=="update" goto slipfetch
+if /I "%~1"=="migrate" goto slipfetch
+if "%~1"=="" (
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$installedScript" menu
+    exit /b %errorlevel%
+)
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$installedScript" %*
 exit /b %errorlevel%
+:slipfetch
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }; Invoke-RestMethod -Uri '$($script:SourceUrl)' -OutFile `$env:TEMP\slip-upgrade.ps1"
+if errorlevel 1 exit /b 1
+set SLIP_FETCHED_UPGRADE=1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%TEMP%\slip-upgrade.ps1" upgrade %*
+set SLIP_ERR=%ERRORLEVEL%
+set SLIP_FETCHED_UPGRADE=
+del /f /q "%TEMP%\slip-upgrade.ps1" >nul 2>&1
+exit /b %SLIP_ERR%
 "@
     Set-Content -LiteralPath (Join-Path $dir "$($script:CommandName).cmd") -Value $menuCmd -Encoding ASCII
     Remove-Item -LiteralPath (Join-Path $dir "$($script:CommandName)-listen.cmd") -Force -ErrorAction SilentlyContinue
@@ -427,7 +467,25 @@ exit /b %errorlevel%
     if ($env:Path -notlike "*$dir*") { $env:Path = "$dir;$env:Path" }
     $invoke = @"
 function global:$($script:CommandName) {
-    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File '$installedScript' menu @args
+    `$cmd = if (`$args.Count -gt 0) { [string]`$args[0] } else { '' }
+    if (`$cmd -match '^(?i:upgrade|update|migrate)$') {
+        `$tmp = Join-Path `$env:TEMP 'slip-upgrade.ps1'
+        Remove-Item -LiteralPath `$tmp -Force -ErrorAction SilentlyContinue
+        try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
+        Invoke-RestMethod -Uri '$($script:SourceUrl)' -OutFile `$tmp -ErrorAction Stop
+        `$env:SLIP_FETCHED_UPGRADE = '1'
+        try { & powershell.exe -NoProfile -ExecutionPolicy Bypass -File `$tmp upgrade @(`$args | Select-Object -Skip 1) }
+        finally {
+            Remove-Item Env:SLIP_FETCHED_UPGRADE -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath `$tmp -Force -ErrorAction SilentlyContinue
+        }
+        return
+    }
+    if (`$args.Count -eq 0) {
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File '$installedScript' menu
+    } else {
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File '$installedScript' @args
+    }
 }
 "@
     Invoke-Expression $invoke
@@ -623,10 +681,10 @@ function Invoke-UnattendedUpgrade {
             Remove-QuickReceiveTask
             Remove-QuickReceiveRunKey
         }
-        if (Test-AutoChat) { Enable-AutoChat -Quiet:$Quiet } else { Stop-AutoChat }
-        Write-SlipLog "Upgrade completed. quickReceive=$([bool]$quickShouldRun)."
+        Enable-AutoChat -Quiet:$Quiet
+        Write-SlipLog "Upgrade completed. version=$($script:Version) quickReceive=$([bool]$quickShouldRun) autoChat=true."
         if (-not $Quiet) {
-            Write-Host "$($script:AppName) is up to date." -ForegroundColor Green
+            Write-Host "$($script:AppName) $($script:Version) is up to date." -ForegroundColor Green
             Write-Host ("Shown as: {0}" -f (Get-DisplayName))
             Write-Host "Command: $($script:CommandName)"
             if ($quickShouldRun) {
@@ -634,7 +692,7 @@ function Invoke-UnattendedUpgrade {
             } else {
                 Write-Host 'Quick receive: off'
             }
-            if (Test-AutoChat) { Write-Host 'Auto chat: on' } else { Write-Host 'Auto chat: off' }
+            Write-Host 'Auto chat: on'
         }
         return $true
     }
@@ -3029,7 +3087,9 @@ function Show-UpgradeScreen {
         Invoke-RestMethod -Uri $script:SourceUrl -OutFile $payload -ErrorAction Stop
         $quick = if (Test-QuickReceive) { '-QuickReceive' } else { '' }
         $arg = "-NoProfile -ExecutionPolicy Bypass -File `"$payload`" upgrade $quick -Quiet".Trim()
+        $env:SLIP_FETCHED_UPGRADE = '1'
         $proc = Start-Process -FilePath powershell.exe -ArgumentList $arg -Wait -PassThru -WindowStyle Hidden
+        Remove-Item Env:SLIP_FETCHED_UPGRADE -ErrorAction SilentlyContinue
         if ($proc.ExitCode -eq 0) { Write-Host 'Upgrade finished.' -ForegroundColor Green }
         else { Write-Host "Upgrade stopped (exit $($proc.ExitCode))." -ForegroundColor Yellow }
     } catch {
@@ -3320,11 +3380,28 @@ switch ($script:Opt.Entry) {
     }
     'upgrade' {
         try {
-            if (Invoke-UnattendedUpgrade -DisplayName $script:Opt.DisplayName -QuickReceive:$script:Opt.QuickReceive -Quiet:$script:Opt.Quiet -MakeNetworkPrivate:$script:Opt.MakeNetworkPrivate) {
-                Exit-Slip 0
+            if ($env:SLIP_FETCHED_UPGRADE -eq '1') {
+                $upgraded = Invoke-UnattendedUpgrade -DisplayName $script:Opt.DisplayName -QuickReceive:$script:Opt.QuickReceive -Quiet:$script:Opt.Quiet -MakeNetworkPrivate:$script:Opt.MakeNetworkPrivate
             } else {
-                Exit-Slip 1
+                if (-not $script:Opt.Quiet) { Write-Host "Downloading the latest $($script:AppName)..." -ForegroundColor Cyan }
+                $payload = Join-Path $env:TEMP 'slip-upgrade.ps1'
+                Remove-Item -LiteralPath $payload -Force -ErrorAction SilentlyContinue
+                Invoke-RestMethod -Uri $script:SourceUrl -OutFile $payload -ErrorAction Stop
+                $forward = @('upgrade')
+                if ($script:Opt.DisplayName) { $forward += @('-DisplayName', $script:Opt.DisplayName) }
+                if ($script:Opt.QuickReceive) { $forward += '-QuickReceive' }
+                if ($script:Opt.MakeNetworkPrivate) { $forward += '-MakeNetworkPrivate' }
+                if ($script:Opt.Quiet) { $forward += '-Quiet' }
+                $env:SLIP_FETCHED_UPGRADE = '1'
+                try {
+                    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $payload @forward
+                    $upgraded = ($LASTEXITCODE -eq 0)
+                } finally {
+                    Remove-Item Env:SLIP_FETCHED_UPGRADE -ErrorAction SilentlyContinue
+                    Remove-Item -LiteralPath $payload -Force -ErrorAction SilentlyContinue
+                }
             }
+            if ($upgraded) { Exit-Slip 0 } else { Exit-Slip 1 }
         } catch {
             if (-not $script:Opt.Quiet) {
                 [Console]::Error.WriteLine($_.Exception.Message)
