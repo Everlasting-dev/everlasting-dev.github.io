@@ -3,6 +3,13 @@
 Internal handoff log for Cursor agents and plugins. Newest entries first.
 Read before editing; append after substantive changes.
 
+## 2026-09-30 - publish Slip 0.0.4
+
+- **Why:** chat should be one PC at a time, and Check and fix should set the network to Private
+- **Changes:** replaced `get` with version 0.0.4. Menus are sectioned. Upgrade is no longer its own Diagnostics item; Check and fix does the update.
+- **Files:** `get`, `AGENT_CHANGELOG.md`
+- **Notes:** Diagnostics → Check and fix downloads this file and may show one approval prompt for the firewall and Private network.
+
 ## 2026-09-30 - publish Slip 0.0.3
 
 - **Why:** a chat window that failed to connect back closed immediately, so the reason was unreadable

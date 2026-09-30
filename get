@@ -12,7 +12,7 @@ $script:RawArgs = @($args)
 $script:RuleTcp = "$($script:AppName) TCP"
 $script:RuleUdp = "$($script:AppName) Discovery"
 $script:BeaconPrefix = $script:AppName.ToUpperInvariant() + '1'
-$script:Version = '0.0.3'
+$script:Version = '0.0.4'
 
 function Initialize-SlipSecurityProtocol {
     try {
@@ -253,6 +253,65 @@ function Set-ActiveNetworksPrivate {
         } catch { }
     }
     return $changed
+}
+
+function Set-ActiveNetworksPublic {
+    $changed = 0
+    foreach ($item in (Get-ActiveNetworkProfiles)) {
+        if ([string]$item.NetworkCategory -eq 'Public') { continue }
+        try {
+            Set-NetConnectionProfile -InterfaceIndex $item.InterfaceIndex -NetworkCategory Public -ErrorAction Stop
+            $changed++
+        } catch { }
+    }
+    return $changed
+}
+
+function Show-NetworkToggle {
+    Clear-Host
+    Write-Host 'Network type' -ForegroundColor Cyan
+    Write-Host ("Version {0}" -f $script:Version) -ForegroundColor DarkGray
+    Write-Host ''
+    $active = @(Get-ActiveNetworkProfiles)
+    if ($active.Count -eq 0) {
+        Write-Host 'This PC is not on a network right now.' -ForegroundColor Yellow
+        Wait-Enter
+        return
+    }
+    foreach ($item in $active) {
+        Write-Host ("{0} ({1}) is {2}." -f $item.Name, $item.InterfaceAlias, $item.NetworkCategory)
+    }
+    Write-Host ''
+    $isPublic = @(Get-PublicNetworkProfiles).Count -gt 0
+    if ($isPublic) {
+        Write-Host 'Private lets other PCs on this network send, receive, and chat with this one.'
+        Write-Host 'Only choose Private on a network you trust, like home or the office.' -ForegroundColor DarkGray
+        Write-Host ''
+        $answer = Read-Host '[Y] Make it Private  [N] Back'
+        if ($answer -notmatch '^[Yy]') { return }
+        $target = 'Private'
+    } else {
+        Write-Host 'Public hides this PC from the others. Slip send, receive, and chat stop'
+        Write-Host 'working on this network until it is Private again.' -ForegroundColor DarkGray
+        Write-Host ''
+        $answer = Read-Host '[Y] Make it Public  [N] Back'
+        if ($answer -notmatch '^[Yy]') { return }
+        $target = 'Public'
+    }
+    Write-Host ''
+    if (Test-IsAdmin) {
+        if ($target -eq 'Private') { [void](Set-ActiveNetworksPrivate) } else { [void](Set-ActiveNetworksPublic) }
+    } else {
+        Write-Host 'Windows needs approval to change the network type.' -ForegroundColor Yellow
+        [void](Invoke-ElevatedEntry -Entry $(if ($target -eq 'Private') { 'netprivate' } else { 'netpublic' }))
+    }
+    $nowPublic = @(Get-PublicNetworkProfiles).Count -gt 0
+    if (($target -eq 'Private' -and -not $nowPublic) -or ($target -eq 'Public' -and $nowPublic)) {
+        Write-Host ("This network is {0} now." -f $target) -ForegroundColor Green
+    } else {
+        Write-Host 'The network type did not change (permission needed?).' -ForegroundColor Yellow
+    }
+    Wait-Enter
 }
 
 function Get-DisplayName {
@@ -1900,7 +1959,8 @@ function Read-ArrowMenu {
         [string]$Title,
         [string[]]$Lines = @(),
         [string]$ZeroLabel = 'Back',
-        [string]$Hint = 'Arrow keys move. Enter chooses. Type the number to choose that line. 0 goes back.'
+        [string]$Hint = 'Arrow keys move. Enter chooses. Type the number to choose that line. 0 goes back.',
+        [int[]]$SeparatorsAfter = @()
     )
     $index = 0
     $interactive = Test-SlipConsoleKeys
@@ -1923,6 +1983,9 @@ function Read-ArrowMenu {
             }
             else {
                 Write-Host ("    " + $row)
+            }
+            if ($SeparatorsAfter -contains $i) {
+                Write-Host '    ----------------------------------------' -ForegroundColor DarkGray
             }
         }
         Write-Host ''
@@ -3184,47 +3247,10 @@ function Show-ChatSession {
 
 function Show-ChatPeople {
     param($People)
-    $selected = @{}
-    for ($i = 0; $i -lt $People.Count; $i++) { $selected[$i] = $true }
-    $cursor = 0
-    while ($true) {
-        Clear-Host
-        Write-Host 'Chat' -ForegroundColor Cyan
-        Write-Host ("Version {0}" -f $script:Version) -ForegroundColor DarkGray
-        Write-Host ''
-        Write-Host 'Choose one PC or several. Space toggles. C continues. Q goes back.'
-        Write-Host ''
-        for ($i = 0; $i -lt $People.Count; $i++) {
-            $mark = if ($selected[$i]) { '[x]' } else { '[ ]' }
-            $line = "[{0}]  {1}  {2} ({3})" -f ($i + 1), $mark, $People[$i].Display, $People[$i].Windows
-            if ($i -eq $cursor -and (Test-SlipConsoleKeys)) { Write-Host ("  > " + $line) -ForegroundColor Green }
-            else { Write-Host ("    " + $line) }
-        }
-        $choice = Read-PickerAction
-        if ([string]::IsNullOrWhiteSpace($choice) -and -not (Test-SlipConsoleKeys)) { return $null }
-        if ($choice -eq 'UP') { if ($cursor -gt 0) { $cursor-- } else { $cursor = $People.Count - 1 }; continue }
-        if ($choice -eq 'DOWN') { if ($cursor -lt ($People.Count - 1)) { $cursor++ } else { $cursor = 0 }; continue }
-        if ($choice -eq 'TOGGLE') { $selected[$cursor] = -not $selected[$cursor]; continue }
-        if ($choice -match '^[Qq]$') { return $null }
-        if ($choice -match '^\d+$') {
-            $number = 0
-            if ([int]::TryParse($choice, [ref]$number)) {
-                $idx = $number - 1
-                if ($idx -ge 0 -and $idx -lt $People.Count) { $selected[$idx] = -not $selected[$idx]; $cursor = $idx }
-            }
-            continue
-        }
-        if ($choice -match '^[Cc]$') {
-            $picked = @()
-            for ($i = 0; $i -lt $People.Count; $i++) { if ($selected[$i]) { $picked += $People[$i] } }
-            if ($picked.Count -eq 0) {
-                Write-Host 'Choose at least one PC.' -ForegroundColor Yellow
-                Start-Sleep -Seconds 1
-                continue
-            }
-            return $picked
-        }
-    }
+    $items = @($People | ForEach-Object { "{0} ({1})" -f $_.Display, $_.Windows })
+    $pick = Read-ArrowMenu -Title 'Chat' -Lines @('Pick the PC you want to chat with.') -Items $items -ZeroLabel 'Back' -Hint 'Arrow keys move. Enter opens the chat with that PC. Type its number. 0 goes back.'
+    if ($pick -lt 0) { return $null }
+    return @($People[$pick])
 }
 
 function Invoke-ChatInvite {
@@ -3385,7 +3411,9 @@ function Repair-SlipStartupEntries {
     # Re-writes the command and startup registry entries when they are missing or
     # wrong. Returns the list of things it had to fix.
     $fixed = @()
-    try { Install-SlipCommand | Out-Null } catch { }
+    # Reinforce like Repair does: recreate folders, refresh the profile and the
+    # slip command, then reconcile the startup registry entries below.
+    try { Ensure-SlipFiles | Out-Null } catch { try { Install-SlipCommand | Out-Null } catch { } }
     $runPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
     $scriptPath = Get-InstalledScriptPath
     if (Test-AutoChat) {
@@ -3500,8 +3528,8 @@ function Invoke-SlipSelfHeal {
         Add-HealReport 'Script policy' 'failed' $_.Exception.Message
     }
 
-    # 3) Startup and command registry entries
-    Write-HealStep 'Checking startup and command entries'
+    # 3) Files, command, and startup registry entries (reinforced like Repair)
+    Write-HealStep 'Reinforcing files, command, and startup entries'
     if ($didUpdate) {
         # The update just reinstalled the command, profile, and startup entries.
         Write-HealResult 'ok' 'reinstalled by the update'
@@ -3522,48 +3550,49 @@ function Invoke-SlipSelfHeal {
     }
     }
 
-    # 4) Firewall rules (may need admin approval)
-    Write-HealStep 'Checking firewall rules'
+    # 4+5) Firewall rules and network type. Both can need admin; when they do and
+    # this PC is not elevated, one 'fixnet' prompt covers adding the rules AND
+    # making the network Private, so the user sees a single approval.
+    Write-HealStep 'Checking firewall rules and network type'
+    $haveFw = (Test-FirewallRule $script:RuleTcp) -and (Test-FirewallRule $script:RuleUdp)
+    $notConnected = @(Get-ActiveNetworkProfiles).Count -eq 0
+    $isPublic = (-not $notConnected) -and (@(Get-PublicNetworkProfiles).Count -gt 0)
+    $needAdmin = (-not $haveFw) -or $isPublic
+    if ($needAdmin) {
+        if (Test-IsAdmin) {
+            if (-not $haveFw) { try { Install-FirewallRules } catch { } }
+            if ($isPublic) { try { [void](Set-ActiveNetworksPrivate) } catch { } }
+        } else {
+            [void](Invoke-ElevatedEntry -Entry 'fixnet')
+        }
+        Write-HealResult 'fixed' 'applied firewall / network fixes'
+    } else {
+        Write-HealResult 'ok' 'nothing to change'
+    }
+
+    # Report firewall and network separately from the current state.
+    Write-HealStep 'Firewall rules'
     $haveFw = (Test-FirewallRule $script:RuleTcp) -and (Test-FirewallRule $script:RuleUdp)
     if ($haveFw) {
         Write-HealResult 'ok' 'both rules present'
         Add-HealReport 'Firewall' 'ok' 'Both rules present'
     } else {
-        if (Test-IsAdmin) {
-            try { Install-FirewallRules } catch { }
-        } else {
-            Write-HealResult 'warn' 'asking Windows for permission'
-            [void](Invoke-ElevatedEntry -Entry 'firewall')
-            Write-HealStep 'Re-checking firewall rules'
-        }
-        $haveFw = (Test-FirewallRule $script:RuleTcp) -and (Test-FirewallRule $script:RuleUdp)
-        if ($haveFw) {
-            Write-HealResult 'fixed' 'rules added'
-            Add-HealReport 'Firewall' 'fixed' 'Rules added'
-        } else {
-            Write-HealResult 'failed' 'rules still missing (permission denied?)'
-            Add-HealReport 'Firewall' 'failed' 'Rules missing'
-        }
+        Write-HealResult 'failed' 'rules still missing (permission denied?)'
+        Add-HealReport 'Firewall' 'failed' 'Rules missing'
     }
 
-    # 5) Network type (reported, not forced)
-    Write-HealStep 'Checking network type'
-    try {
-        $active = @(Get-ActiveNetworkProfiles)
-        $public = @(Get-PublicNetworkProfiles)
-        if ($active.Count -eq 0) {
-            Write-HealResult 'warn' 'this PC is not on a network'
-            Add-HealReport 'Network' 'warn' 'Not connected'
-        } elseif ($public.Count -gt 0) {
-            Write-HealResult 'warn' 'Public - set it Private to be reachable'
-            Add-HealReport 'Network' 'warn' 'Public (set it Private)'
-        } else {
-            Write-HealResult 'ok' 'Private'
-            Add-HealReport 'Network' 'ok' 'Private'
-        }
-    } catch {
-        Write-HealResult 'warn' 'could not read the network type'
-        Add-HealReport 'Network' 'warn' 'Unknown'
+    Write-HealStep 'Network type'
+    $active = @(Get-ActiveNetworkProfiles)
+    $public = @(Get-PublicNetworkProfiles)
+    if ($active.Count -eq 0) {
+        Write-HealResult 'warn' 'this PC is not on a network'
+        Add-HealReport 'Network' 'warn' 'Not connected'
+    } elseif ($public.Count -gt 0) {
+        Write-HealResult 'failed' 'still Public (permission denied?)'
+        Add-HealReport 'Network' 'failed' 'Still Public'
+    } else {
+        Write-HealResult 'ok' 'Private'
+        Add-HealReport 'Network' 'ok' 'Private'
     }
 
     return @($report)
@@ -3610,37 +3639,23 @@ function Show-SelfHealScreen {
 
 function Show-DiagnosticsMenu {
     while ($true) {
-        $active = @(Get-ActiveNetworkProfiles)
-        $public = @(Get-PublicNetworkProfiles)
-        $netLabel = 'Network: Private'
-        if ($active.Count -eq 0) { $netLabel = 'Network: not connected' }
-        elseif ($public.Count -gt 0) { $netLabel = "Network: $($public[0].NetworkCategory), make Private" }
-        $pick = Read-ArrowMenu -Title 'Diagnostics' -Lines @('Repair, upgrade, and logs. Everyday send and receive stay on the main menu.') -Items @(
+        $pick = Read-ArrowMenu -Title 'Diagnostics' -Lines @('Fix and check this PC, then names and logs.') -Items @(
             'Check and fix (one click)',
             'Status',
             'Repair',
-            'Upgrade',
             'Remove',
             'Rename this PC',
-            $netLabel,
             'Open Debug folder',
             'Chat log'
-        ) -ZeroLabel 'Back'
+        ) -SeparatorsAfter @(3) -ZeroLabel 'Back'
         switch ($pick) {
             0 { Show-SelfHealScreen }
             1 { Show-Status }
             2 { Show-RepairScreen }
-            3 { Show-UpgradeScreen }
-            4 { Invoke-RemoveSlip }
-            5 { Rename-ThisPc }
-            6 {
-                Clear-Host
-                Write-Host 'Network type' -ForegroundColor Cyan
-                [void](Invoke-MakeNetworkPrivate)
-                Wait-Enter
-            }
-            7 { Open-DebugFolder }
-            8 { Show-ChatLog }
+            3 { Invoke-RemoveSlip }
+            4 { Rename-ThisPc }
+            5 { Open-DebugFolder }
+            6 { Show-ChatLog }
             default { return }
         }
     }
@@ -3650,19 +3665,26 @@ function Show-MoreMenu {
     while ($true) {
         $quickLabel = if (Test-QuickReceive) { 'Quick receive: On' } else { 'Quick receive: Off' }
         $chatLabel = if (Test-AutoChat) { 'Auto chat: On' } else { 'Auto chat: Off' }
-        $pick = Read-ArrowMenu -Title 'More' -Lines @('How-to and connection. Repair and logs are under Diagnostics.') -Items @(
+        $active = @(Get-ActiveNetworkProfiles)
+        $public = @(Get-PublicNetworkProfiles)
+        $netLabel = if ($active.Count -eq 0) { 'Network: not connected' } elseif ($public.Count -gt 0) { 'Network: Public' } else { 'Network: Private' }
+        $pick = Read-ArrowMenu -Title 'More' -Lines @('Folders and help, then on/off switches, then diagnostics.') -Items @(
+            'Folders',
             'How to send and receive',
             'Check connection',
             $quickLabel,
             $chatLabel,
+            $netLabel,
             'Diagnostics'
-        ) -ZeroLabel 'Back'
+        ) -SeparatorsAfter @(2, 5) -ZeroLabel 'Back'
         switch ($pick) {
-            0 { Show-HowTo }
-            1 { Show-CheckConnection }
-            2 { Set-QuickReceive -On (-not (Test-QuickReceive)) }
-            3 { Set-AutoChat -On (-not (Test-AutoChat)) }
-            4 { Show-DiagnosticsMenu }
+            0 { Show-FoldersMenu }
+            1 { Show-HowTo }
+            2 { Show-CheckConnection }
+            3 { Set-QuickReceive -On (-not (Test-QuickReceive)) }
+            4 { Set-AutoChat -On (-not (Test-AutoChat)) }
+            5 { Show-NetworkToggle }
+            6 { Show-DiagnosticsMenu }
             default { return }
         }
     }
@@ -3688,15 +3710,13 @@ function Show-SlipMenu {
                 'Send files',
                 'Receive files',
                 'Chat',
-                'Folders',
                 'More'
-            ) -ZeroLabel $zero
+            ) -SeparatorsAfter @(1, 2) -ZeroLabel $zero
             switch ($pick) {
                 0 { Show-SendFiles }
                 1 { Show-ReceiveFiles }
                 2 { Show-StartChat }
-                3 { Show-FoldersMenu }
-                4 { Show-MoreMenu }
+                3 { Show-MoreMenu }
                 default { return }
             }
         }
@@ -3840,6 +3860,8 @@ function Get-EntryOptions {
         elseif ($token -eq 'firewall') { $o.Entry = 'firewall' }
         elseif ($token -eq 'unfirewall') { $o.Entry = 'unfirewall' }
         elseif ($token -eq 'netprivate') { $o.Entry = 'netprivate' }
+        elseif ($token -eq 'netpublic') { $o.Entry = 'netpublic' }
+        elseif ($token -eq 'fixnet') { $o.Entry = 'fixnet' }
         elseif ($token -eq 'serve') { $o.Entry = 'serve' }
         elseif ($token -eq 'recv') { $o.Entry = 'recv' }
         elseif ($token -eq 'listen') { $o.Entry = 'listen' }
@@ -3957,6 +3979,21 @@ switch ($script:Opt.Entry) {
             Write-Host $_.Exception.Message -ForegroundColor Red
             Exit-Slip 1
         }
+    }
+    'netpublic' {
+        try {
+            [void](Set-ActiveNetworksPublic)
+            Exit-Slip 0
+        } catch {
+            Write-Host $_.Exception.Message -ForegroundColor Red
+            Exit-Slip 1
+        }
+    }
+    'fixnet' {
+        # One elevated pass for the one-click fix: firewall rules plus make Private.
+        try { Install-FirewallRules } catch { }
+        try { [void](Set-ActiveNetworksPrivate) } catch { }
+        Exit-Slip 0
     }
     'serve' {
         if ($script:Opt.Paths.Count -lt 1) {
