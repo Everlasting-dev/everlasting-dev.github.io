@@ -3,6 +3,13 @@
 Internal handoff log for Cursor agents and plugins. Newest entries first.
 Read before editing; append after substantive changes.
 
+## 2026-09-30 - publish Slip 0.0.1
+
+- **Why:** other PCs were still downloading 1.3.5, so they could not get the separate chat window
+- **Changes:** replaced `get` with version 0.0.1. This PC was installed from the local script with `SLIP_FETCHED_UPGRADE=1`.
+- **Files:** `get`, `AGENT_CHANGELOG.md`
+- **Notes:** Chat's separate Command Prompt window needs both PCs on 0.0.1. A PC still on 1.3.x gets there with `slip upgrade` once. After that, Diagnostics, Check and fix is the updater.
+
 ## 2026-09-30 - Slip 1.3.5 visible online upgrade check
 
 - **Why:** A laptop test made it look like `slip upgrade` was rerunning the local saved script, because the live script had been changed without a visible version bump.

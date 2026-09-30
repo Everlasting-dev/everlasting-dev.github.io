@@ -12,7 +12,7 @@ $script:RawArgs = @($args)
 $script:RuleTcp = "$($script:AppName) TCP"
 $script:RuleUdp = "$($script:AppName) Discovery"
 $script:BeaconPrefix = $script:AppName.ToUpperInvariant() + '1'
-$script:Version = '1.3.5'
+$script:Version = '0.0.1'
 
 function Initialize-SlipSecurityProtocol {
     try {
@@ -382,6 +382,63 @@ function __COMMAND__ {
     $block = $block.Replace('__SOURCE_URL__', ($script:SourceUrl -replace "'", "''"))
     $block = $block.Replace('__APP_NAME__', ($script:AppName -replace "'", "''"))
     return $block
+}
+
+function Set-SlipScriptPolicy {
+    param([switch]$Quiet)
+    $result = @{ Changed = @(); Notes = @(); Locked = $false }
+    $safe = @('RemoteSigned', 'Unrestricted', 'Bypass')
+    # A Group Policy can pin a policy we cannot override from here. Report it so
+    # the user knows the rest has to be done by whoever manages the PC.
+    foreach ($gpoScope in @('MachinePolicy', 'UserPolicy')) {
+        try {
+            $val = Get-ExecutionPolicy -Scope $gpoScope -ErrorAction Stop
+            if ($val -and $val -ne 'Undefined' -and $safe -notcontains $val) {
+                $result.Locked = $true
+                $result.Notes += ("Group Policy ({0}) forces {1}." -f $gpoScope, $val)
+            }
+        } catch { }
+    }
+    $scopes = @('CurrentUser')
+    if (Test-IsAdmin) { $scopes += 'LocalMachine' }
+    foreach ($scope in $scopes) {
+        try {
+            $cur = Get-ExecutionPolicy -Scope $scope -ErrorAction Stop
+            if ($safe -notcontains $cur) {
+                Set-ExecutionPolicy -Scope $scope -ExecutionPolicy RemoteSigned -Force -ErrorAction Stop
+                $result.Changed += ("{0}: {1} -> RemoteSigned" -f $scope, $cur)
+            }
+        } catch {
+            $result.Notes += ("{0}: {1}" -f $scope, $_.Exception.Message)
+        }
+    }
+    # RemoteSigned still blocks unsigned scripts that carry an internet mark.
+    # Slip writes its own files locally, but unblock them so nothing is flagged.
+    try {
+        $files = @()
+        try { $files += (Get-InstalledScriptPath) } catch { }
+        try { $files += @(Get-ProfilePaths) } catch { }
+        foreach ($p in $files) {
+            if ($p -and (Test-Path -LiteralPath $p)) {
+                Unblock-File -LiteralPath $p -ErrorAction SilentlyContinue
+            }
+        }
+    } catch { }
+    if (-not $Quiet) {
+        if ($result.Changed.Count -gt 0) {
+            Write-Host 'PowerShell now allows local scripts:' -ForegroundColor Green
+            foreach ($c in $result.Changed) { Write-Host ("  {0}" -f $c) }
+        } else {
+            Write-Host 'PowerShell already allows local scripts. Nothing to change.' -ForegroundColor Green
+        }
+        if ($result.Locked) {
+            Write-Host ''
+            Write-Host 'A Group Policy still forces a stricter setting:' -ForegroundColor Yellow
+            foreach ($n in $result.Notes) { Write-Host ("  {0}" -f $n) -ForegroundColor Yellow }
+            Write-Host 'That part has to be changed by whoever manages this PC.' -ForegroundColor Yellow
+        }
+    }
+    return $result
 }
 
 function Set-ProfileBlock {
@@ -1536,9 +1593,12 @@ function Show-SendFiles {
         }
         $selected = @{}
         for ($i = 0; $i -lt $items.Count; $i++) { $selected[$i] = $true }
-        $confirmed = $false
-        $picked = @()
         $cursor = 0
+        $picked = @()
+        # Step loop: file selection, then choosing a PC. Backing out of the PC
+        # search returns here to the file list instead of the main menu.
+        while ($true) {
+        $confirmed = $false
         while (-not $confirmed) {
             Clear-Host
             Write-Host 'Send files' -ForegroundColor Cyan
@@ -1645,7 +1705,7 @@ function Show-SendFiles {
             $fallback = Read-Host '[I] Type IP  [P] Send with PIN  [Q] Back'
             if ($fallback -match '^[Ii]') {
                 $manual = Read-QuickReceiveTargetByIp
-                if (-not $manual) { return }
+                if (-not $manual) { continue }
                 $usePin = $false
                 $quickTarget = $manual
             }
@@ -1653,7 +1713,7 @@ function Show-SendFiles {
                 $usePin = $true
             }
             else {
-                return
+                continue
             }
         }
         else {
@@ -1664,14 +1724,14 @@ function Show-SendFiles {
                 ("This send is {0}." -f (Format-ByteSize $sendTotal)),
                 'Pick the PC that should receive these files.'
             ) -Items $labels -ZeroLabel 'Back' -Hint 'Arrow keys move. Enter chooses. Type the number to choose that PC. 0 goes back.'
-            if ($how -lt 0) { return }
+            if ($how -lt 0) { continue }
             if ($how -lt $quick.Count) {
                 $usePin = $false
                 $quickTarget = $quick[$how]
             }
             elseif ($how -eq $quick.Count) {
                 $manual = Read-QuickReceiveTargetByIp
-                if (-not $manual) { return }
+                if (-not $manual) { continue }
                 $usePin = $false
                 $quickTarget = $manual
             }
@@ -1704,6 +1764,7 @@ function Show-SendFiles {
         }
         Wait-Enter
         return
+        }
     }
 }
 
@@ -2723,14 +2784,44 @@ function Receive-ChatWire {
     return $found
 }
 
+function Test-SocketDead {
+    param($Client)
+    if (-not $Client) { return $false }
+    try {
+        $sock = $Client.Client
+        if (-not $sock) { return $true }
+        # Poll returns true when the socket is readable. If it is readable but no
+        # bytes are waiting, the other end has closed or reset the connection -
+        # which is what happens when that PC closes the window or presses Ctrl+C.
+        if ($sock.Poll(0, [System.Net.Sockets.SelectMode]::SelectRead) -and $sock.Available -eq 0) { return $true }
+        return $false
+    } catch { return $true }
+}
+
+function Start-ChatConsole {
+    param([string]$EntryArgs, [string]$Title = 'Slip chat')
+    # Open a normal Command Prompt window that hosts the chat, instead of taking
+    # over the current Slip window or opening a PowerShell window. cmd.exe gives
+    # the plain console; it runs the PowerShell chat entry inside it. The title
+    # is stripped to safe characters so a peer's name can never inject a command.
+    # EntryArgs only ever carries base64 fields plus an IP/port/room, none of
+    # which are cmd metacharacters.
+    $scriptPath = Get-SlipLaunchPath
+    $safeTitle = ($Title -replace '[^\w \-]', '').Trim()
+    if (-not $safeTitle) { $safeTitle = 'Slip chat' }
+    if ($safeTitle.Length -gt 40) { $safeTitle = $safeTitle.Substring(0, 40) }
+    $inner = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{0}" {1}' -f $scriptPath, $EntryArgs
+    $full = '/c title {0} & {1}' -f $safeTitle, $inner
+    Start-Process -FilePath $env:ComSpec -ArgumentList $full | Out-Null
+}
+
 function Start-ChatPopup {
     param([string]$Room, [string]$Address, [int]$Port, [string]$FromName, [string]$Text)
-    $scriptPath = Get-SlipLaunchPath
     $payload = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Text))
     $from = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($FromName))
-    $arg = "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`" chatjoin -Room $Room -Address $Address -Port $Port -PeerName $from -OpeningB64 $payload"
+    $entryArgs = "chatjoin -Room $Room -Address $Address -Port $Port -PeerName $from -OpeningB64 $payload"
     Write-TransferDebug 'chat.popup.start' @{ remote = $Address; port = $Port; from = $FromName }
-    Start-Process -FilePath powershell.exe -ArgumentList $arg | Out-Null
+    Start-ChatConsole -EntryArgs $entryArgs -Title ("Slip chat - {0}" -f $FromName)
 }
 
 function Enable-AutoChat {
@@ -2861,6 +2952,7 @@ function Show-ChatSession {
         [string]$Title,
         $Listener,
         $Stream,
+        $Client,
         [string]$OpeningFrom,
         [string]$OpeningText,
         [switch]$IsHost
@@ -2869,6 +2961,7 @@ function Show-ChatSession {
     $members = @()
     $closed = $false
     $draft = ''
+    $rawInput = Test-SlipConsoleKeys
     Clear-Host
     Write-Host 'Chat' -ForegroundColor Cyan
     Write-Host ("Version {0}    {1}" -f $script:Version, $Title) -ForegroundColor DarkGray
@@ -2877,12 +2970,11 @@ function Show-ChatSession {
         Write-Host ("{0}: {1}" -f $OpeningFrom, $OpeningText)
         Write-ChatLog -Room $Room -Kind 'msg' -Name $OpeningFrom -Text $OpeningText
     }
-    Write-Host 'Type a message and press Enter. Esc closes the chat.' -ForegroundColor DarkGray
+    Write-Host 'Type a message and press Enter. Press Esc to leave (it confirms if the other PC is still here).' -ForegroundColor DarkGray
     Write-Host ''
 
     function Write-ChatNotice([string]$Kind, [string]$Name) {
-        Write-Host ''
-        Write-Host (Format-ChatNotice $Kind $Name) -ForegroundColor DarkGray
+        Write-ChatLine (Format-ChatNotice $Kind $Name) ([ConsoleColor]::DarkGray)
         Write-ChatLog -Room $Room -Kind $Kind -Name $Name -Text ''
     }
     function Broadcast-Chat([string]$Line, $Except) {
@@ -2890,6 +2982,21 @@ function Show-ChatSession {
             if ($Except -and ($member -eq $Except)) { continue }
             try { Send-ChatWire -Stream $member.Stream -Line $Line } catch { }
         }
+    }
+    function Clear-ChatInput {
+        $w = 80
+        try { $w = $Host.UI.RawUI.BufferSize.Width } catch { }
+        if ($w -lt 2) { $w = 80 }
+        Write-Host ("`r" + (' ' * ($w - 1)) + "`r") -NoNewline
+    }
+    function Show-ChatInput {
+        Write-Host ("`r> {0}" -f $draft) -NoNewline
+    }
+    function Write-ChatLine {
+        param([string]$Line, [ConsoleColor]$Color = [ConsoleColor]::Gray)
+        if ($rawInput) { Clear-ChatInput }
+        Write-Host $Line -ForegroundColor $Color
+        if ($rawInput) { Show-ChatInput }
     }
 
     $solo = @{ Stream = $Stream; Pending = '' }
@@ -2904,6 +3011,7 @@ function Show-ChatSession {
         }
     }
 
+    if ($rawInput) { Show-ChatInput }
     while (-not $closed) {
         if ($IsHost -and $Listener -and $Listener.Pending()) {
             $incoming = $Listener.AcceptTcpClient()
@@ -2924,14 +3032,14 @@ function Show-ChatSession {
         }
         $drop = @()
         foreach ($member in @($members)) {
+            if (Test-SocketDead $member.Client) { $drop += $member; continue }
             try {
                 foreach ($line in @(Receive-ChatWire $member)) {
                     if ($line -eq 'BYE') { $drop += $member; continue }
                     if ($line.StartsWith('MSG|')) {
                         $text = ''
                         try { $text = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($line.Substring(4))) } catch { continue }
-                        Write-Host ''
-                        Write-Host ("{0}: {1}" -f $member.Name, $text)
+                        Write-ChatLine ("{0}: {1}" -f $member.Name, $text)
                         Write-ChatLog -Room $Room -Kind 'msg' -Name $member.Name -Text $text
                         Write-TransferDebug 'chat.message.received' @{ room = $Room; from = $member.Name; bytes = $text.Length }
                         Broadcast-Chat ("MSG|{0}|{1}" -f $member.Name, $line.Substring(4)) $member
@@ -2946,7 +3054,13 @@ function Show-ChatSession {
             try { $member.Client.Close() } catch { }
             $members = @($members | Where-Object { $_ -ne $member })
         }
-        if (-not $IsHost -and $Stream) {
+        if (-not $IsHost -and $Stream -and -not $closed -and (Test-SocketDead $Client)) {
+            Write-ChatLine ('{0} left. Chat closed.' -f $Title) ([ConsoleColor]::Yellow)
+            Write-ChatLog -Room $Room -Kind 'closed' -Name $Title -Text ''
+            Write-TransferDebug 'chat.peer.lost' @{ room = $Room; peer = $Title }
+            $closed = $true
+        }
+        if (-not $IsHost -and $Stream -and -not $closed) {
             try {
                 foreach ($line in @(Receive-ChatWire $solo)) {
                     if ($line.StartsWith('SYS|')) {
@@ -2960,8 +3074,7 @@ function Show-ChatSession {
                         $bits = $line.Split('|')
                         $text = ''
                         try { $text = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($bits[2])) } catch { continue }
-                        Write-Host ''
-                        Write-Host ("{0}: {1}" -f $bits[1], $text)
+                        Write-ChatLine ("{0}: {1}" -f $bits[1], $text)
                         Write-ChatLog -Room $Room -Kind 'msg' -Name $bits[1] -Text $text
                         Write-TransferDebug 'chat.message.received' @{ room = $Room; from = $bits[1]; bytes = $text.Length }
                     }
@@ -2972,12 +3085,11 @@ function Show-ChatSession {
             }
         }
         if ($closed) { break }
-        if (-not (Test-SlipConsoleKeys)) {
+        if (-not $rawInput) {
             $typed = Read-Host '>'
             if ($typed -eq '/quit') { $closed = $true; break }
             if ($typed) {
                 $packed = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($typed))
-                Write-Host ("{0}: {1}" -f $me, $typed)
                 Write-ChatLog -Room $Room -Kind 'msg' -Name $me -Text $typed
                 Write-TransferDebug 'chat.message.sent' @{ room = $Room; bytes = $typed.Length }
                 if ($IsHost) { Broadcast-Chat ("MSG|{0}|{1}" -f $me, $packed) }
@@ -2986,29 +3098,43 @@ function Show-ChatSession {
             continue
         }
         if (-not $Host.UI.RawUI.KeyAvailable) {
-            Start-Sleep -Milliseconds 15
+            Start-Sleep -Milliseconds 8
             continue
         }
         $key = Read-SlipKey
-        if ($key.Name -eq 'Escape') { $closed = $true; break }
+        if ($key.Name -eq 'Escape') {
+            $peersHere = if ($IsHost) { @($members).Count -gt 0 } else { ($Client -and -not (Test-SocketDead $Client)) }
+            if (-not $peersHere) { $closed = $true; break }
+            Clear-ChatInput
+            Write-Host ''
+            Write-Host 'Leave the chat? The other PC is still connected.  [Y] Leave   [N] Stay' -ForegroundColor Yellow
+            $ans = Read-SlipKey
+            while ($ans.Name -ne 'Enter' -and $ans.Name -ne 'Escape' -and ($ans.Char -notmatch '^[YyNn]$')) { $ans = Read-SlipKey }
+            if ($ans.Char -match '^[Yy]$' -or $ans.Name -eq 'Escape') { $closed = $true; break }
+            Write-Host 'Still in the chat.' -ForegroundColor DarkGray
+            Show-ChatInput
+            continue
+        }
         if ($key.Name -eq 'Enter') {
             $typed = $draft.Trim()
             $draft = ''
-            Write-Host ''
-            if (-not $typed) { continue }
+            if (-not $typed) { Clear-ChatInput; Show-ChatInput; continue }
             $packed = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($typed))
-            Write-Host ("{0}: {1}" -f $me, $typed)
+            Clear-ChatInput
+            Write-Host ("You: {0}" -f $typed)
             Write-ChatLog -Room $Room -Kind 'msg' -Name $me -Text $typed
             Write-TransferDebug 'chat.message.sent' @{ room = $Room; bytes = $typed.Length }
             if ($IsHost) { Broadcast-Chat ("MSG|{0}|{1}" -f $me, $packed) }
             elseif ($Stream) { Send-ChatWire -Stream $Stream -Line ("MSG|{0}" -f $packed) }
+            Show-ChatInput
             continue
         }
         if ($key.Name -eq 'Backspace') {
             if ($draft.Length -gt 0) { $draft = $draft.Substring(0, $draft.Length - 1) }
         }
         elseif ($key.Char) { $draft += $key.Char }
-        Write-Host ("`r> {0} " -f $draft) -NoNewline
+        Clear-ChatInput
+        Show-ChatInput
     }
     if ($IsHost) {
         Broadcast-Chat 'SYS|closed|'
@@ -3023,6 +3149,11 @@ function Show-ChatSession {
         try { Send-ChatWire -Stream $Stream -Line 'BYE' } catch { }
         try { $Stream.Close() } catch { }
         Write-TransferDebug 'chat.session.closed' @{ room = $Room; role = 'guest' }
+        if ($rawInput) {
+            Write-Host ''
+            Write-Host 'Chat closed. Press Enter to close this window.' -ForegroundColor DarkGray
+            [void](Read-Host)
+        }
     }
 }
 
@@ -3150,7 +3281,15 @@ function Show-StartChat {
         Wait-Enter
         return
     }
-    Start-ChatWith -People $picked -Text $text.Trim()
+    # Open the chat in its own Command Prompt window so this Slip window stays on
+    # the menu. The host listener, invites, and session all run in that window.
+    $slim = @($picked | ForEach-Object { @{ IP = $_.IP; Port = $_.Port; Display = $_.Display; Windows = $_.Windows } })
+    $json = ConvertTo-Json $slim -Compress -Depth 4
+    $peopleB64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
+    $openB64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($text.Trim()))
+    Start-ChatConsole -EntryArgs ("chathost -PeopleB64 {0} -OpeningB64 {1}" -f $peopleB64, $openB64) -Title 'Slip chat'
+    Write-Host 'Chat opened in a new window.' -ForegroundColor Green
+    Start-Sleep -Milliseconds 700
 }
 
 function Show-FoldersMenu {
@@ -3196,6 +3335,254 @@ function Show-UpgradeScreen {
     Wait-Enter
 }
 
+function Get-OnlineSlipVersion {
+    # Downloads the published script and returns @{ Version; Path; Bytes }, or
+    # $null when it cannot be reached. The caller removes the temp file.
+    $tmp = Join-Path $env:TEMP ("{0}-online.ps1" -f $script:CommandName)
+    Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
+    try {
+        Invoke-RestMethod -Uri $script:SourceUrl -OutFile $tmp -ErrorAction Stop
+    } catch {
+        return $null
+    }
+    if (-not (Test-Path -LiteralPath $tmp)) { return $null }
+    $ver = 'unknown'
+    try {
+        $text = [IO.File]::ReadAllText($tmp)
+        $m = [regex]::Match($text, "\`$script:Version\s*=\s*'([^']+)'")
+        if ($m.Success) { $ver = $m.Groups[1].Value }
+    } catch { }
+    return @{ Version = $ver; Path = $tmp; Bytes = (Get-Item -LiteralPath $tmp).Length }
+}
+
+function Repair-SlipStartupEntries {
+    # Re-writes the command and startup registry entries when they are missing or
+    # wrong. Returns the list of things it had to fix.
+    $fixed = @()
+    try { Install-SlipCommand | Out-Null } catch { }
+    $runPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+    $scriptPath = Get-InstalledScriptPath
+    if (Test-AutoChat) {
+        $expected = "`"powershell.exe`" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`" chatlisten"
+        $have = $null
+        try { $have = [string](Get-ItemPropertyValue -LiteralPath $runPath -Name (Get-ChatRunName) -ErrorAction Stop) } catch { }
+        if ($have -ne $expected) {
+            Enable-AutoChat -Quiet | Out-Null
+            $fixed += 'Auto chat startup'
+        }
+    }
+    if (Test-QuickReceive) {
+        $expected = Get-QuickReceiveCommandLine
+        $have = $null
+        try { $have = [string](Get-ItemPropertyValue -LiteralPath $runPath -Name (Get-QuickRunName) -ErrorAction Stop) } catch { }
+        if ($have -ne $expected) {
+            [void](Set-QuickReceiveRunKey)
+            $fixed += 'Quick receive startup'
+        }
+    }
+    return @($fixed)
+}
+
+function Write-HealStep {
+    param([string]$Text)
+    Write-Host ("  - {0} ... " -f $Text) -NoNewline
+}
+
+function Write-HealResult {
+    param([string]$Status, [string]$Detail)
+    $color = switch ($Status) {
+        'ok'     { [ConsoleColor]::Green }
+        'fixed'  { [ConsoleColor]::Green }
+        'warn'   { [ConsoleColor]::Yellow }
+        'failed' { [ConsoleColor]::Red }
+        default  { [ConsoleColor]::Gray }
+    }
+    $label = switch ($Status) {
+        'ok'     { 'OK' }
+        'fixed'  { 'FIXED' }
+        'warn'   { 'CHECK' }
+        'failed' { 'FAILED' }
+        default  { $Status }
+    }
+    if ($Detail) { Write-Host ("{0} - {1}" -f $label, $Detail) -ForegroundColor $color }
+    else { Write-Host $label -ForegroundColor $color }
+}
+
+function Invoke-SlipSelfHeal {
+    # Runs every check in order, printing progress as it goes so the window never
+    # looks frozen, and returns an ordered report list.
+    $report = New-Object System.Collections.ArrayList
+    $didUpdate = $false
+    function Add-HealReport($name, $status, $detail) {
+        [void]$report.Add([pscustomobject]@{ Name = $name; Status = $status; Detail = $detail })
+    }
+
+    # 1) Version and update
+    Write-HealStep 'Checking for the latest version'
+    $online = Get-OnlineSlipVersion
+    if (-not $online) {
+        Write-HealResult 'warn' 'update site unreachable (offline?)'
+        Add-HealReport 'Update' 'warn' 'Update site unreachable'
+    }
+    elseif ($online.Version -eq 'unknown') {
+        Write-HealResult 'warn' 'downloaded, but its version could not be read'
+        Add-HealReport 'Update' 'warn' 'Online version unreadable'
+    }
+    elseif ($online.Version -eq $script:Version) {
+        Write-HealResult 'ok' ("already on {0}" -f $script:Version)
+        Add-HealReport 'Update' 'ok' ("Latest ({0})" -f $script:Version)
+    }
+    else {
+        Write-HealResult 'fixed' ("{0} -> {1}, installing" -f $script:Version, $online.Version)
+        Write-HealStep ("Installing {0}" -f $online.Version)
+        $code = 1
+        try {
+            $env:SLIP_FETCHED_UPGRADE = '1'
+            # Redirect the child's output so it cannot leak into this function's
+            # return value; $LASTEXITCODE still reflects the child's exit code.
+            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $online.Path upgrade -Quiet 2>&1 | Out-Null
+            $code = $LASTEXITCODE
+        } catch { $code = 1 }
+        finally { Remove-Item Env:SLIP_FETCHED_UPGRADE -ErrorAction SilentlyContinue }
+        if ($code -eq 0) {
+            $didUpdate = $true
+            Write-HealResult 'fixed' ("installed {0} - reopen Slip to use it" -f $online.Version)
+            Add-HealReport 'Update' 'fixed' ("Updated to {0}; reopen Slip" -f $online.Version)
+        } else {
+            Write-HealResult 'failed' 'the update did not finish'
+            Add-HealReport 'Update' 'failed' 'Update did not finish'
+        }
+    }
+    if ($online -and $online.Path) { Remove-Item -LiteralPath $online.Path -Force -ErrorAction SilentlyContinue }
+
+    # 2) Script policy (enable running scripts)
+    Write-HealStep 'Checking PowerShell script policy'
+    try {
+        $pol = Set-SlipScriptPolicy -Quiet
+        if ($pol.Locked) {
+            Write-HealResult 'warn' 'a Group Policy forces a stricter setting'
+            Add-HealReport 'Script policy' 'warn' (($pol.Notes) -join '; ')
+        } elseif ($pol.Changed.Count -gt 0) {
+            Write-HealResult 'fixed' (($pol.Changed) -join '; ')
+            Add-HealReport 'Script policy' 'fixed' (($pol.Changed) -join '; ')
+        } else {
+            Write-HealResult 'ok' 'local scripts already allowed'
+            Add-HealReport 'Script policy' 'ok' 'Local scripts allowed'
+        }
+    } catch {
+        Write-HealResult 'failed' $_.Exception.Message
+        Add-HealReport 'Script policy' 'failed' $_.Exception.Message
+    }
+
+    # 3) Startup and command registry entries
+    Write-HealStep 'Checking startup and command entries'
+    if ($didUpdate) {
+        # The update just reinstalled the command, profile, and startup entries.
+        Write-HealResult 'ok' 'reinstalled by the update'
+        Add-HealReport 'Startup entries' 'ok' 'Reinstalled by update'
+    } else {
+    try {
+        $entryFix = Repair-SlipStartupEntries
+        if ($entryFix.Count -gt 0) {
+            Write-HealResult 'fixed' ("re-added: {0}" -f ($entryFix -join ', '))
+            Add-HealReport 'Startup entries' 'fixed' ("Re-added: {0}" -f ($entryFix -join ', '))
+        } else {
+            Write-HealResult 'ok' 'command and startup entries in place'
+            Add-HealReport 'Startup entries' 'ok' 'In place'
+        }
+    } catch {
+        Write-HealResult 'failed' $_.Exception.Message
+        Add-HealReport 'Startup entries' 'failed' $_.Exception.Message
+    }
+    }
+
+    # 4) Firewall rules (may need admin approval)
+    Write-HealStep 'Checking firewall rules'
+    $haveFw = (Test-FirewallRule $script:RuleTcp) -and (Test-FirewallRule $script:RuleUdp)
+    if ($haveFw) {
+        Write-HealResult 'ok' 'both rules present'
+        Add-HealReport 'Firewall' 'ok' 'Both rules present'
+    } else {
+        if (Test-IsAdmin) {
+            try { Install-FirewallRules } catch { }
+        } else {
+            Write-HealResult 'warn' 'asking Windows for permission'
+            [void](Invoke-ElevatedEntry -Entry 'firewall')
+            Write-HealStep 'Re-checking firewall rules'
+        }
+        $haveFw = (Test-FirewallRule $script:RuleTcp) -and (Test-FirewallRule $script:RuleUdp)
+        if ($haveFw) {
+            Write-HealResult 'fixed' 'rules added'
+            Add-HealReport 'Firewall' 'fixed' 'Rules added'
+        } else {
+            Write-HealResult 'failed' 'rules still missing (permission denied?)'
+            Add-HealReport 'Firewall' 'failed' 'Rules missing'
+        }
+    }
+
+    # 5) Network type (reported, not forced)
+    Write-HealStep 'Checking network type'
+    try {
+        $active = @(Get-ActiveNetworkProfiles)
+        $public = @(Get-PublicNetworkProfiles)
+        if ($active.Count -eq 0) {
+            Write-HealResult 'warn' 'this PC is not on a network'
+            Add-HealReport 'Network' 'warn' 'Not connected'
+        } elseif ($public.Count -gt 0) {
+            Write-HealResult 'warn' 'Public - set it Private to be reachable'
+            Add-HealReport 'Network' 'warn' 'Public (set it Private)'
+        } else {
+            Write-HealResult 'ok' 'Private'
+            Add-HealReport 'Network' 'ok' 'Private'
+        }
+    } catch {
+        Write-HealResult 'warn' 'could not read the network type'
+        Add-HealReport 'Network' 'warn' 'Unknown'
+    }
+
+    return @($report)
+}
+
+function Show-SelfHealScreen {
+    Clear-Host
+    Write-Host 'Check and fix' -ForegroundColor Cyan
+    Write-Host ("Version {0}" -f $script:Version) -ForegroundColor DarkGray
+    Write-Host ''
+    Write-Host 'This checks the version, script policy, startup entries, and firewall,'
+    Write-Host 'and fixes anything it can. Windows may ask for permission for the firewall.'
+    Write-Host ''
+    $report = @(Invoke-SlipSelfHeal)
+    Write-Host ''
+    Write-Host 'Report' -ForegroundColor Cyan
+    $bad = 0
+    foreach ($row in $report) {
+        $color = switch ($row.Status) {
+            'ok'     { [ConsoleColor]::Green }
+            'fixed'  { [ConsoleColor]::Green }
+            'warn'   { [ConsoleColor]::Yellow }
+            'failed' { [ConsoleColor]::Red }
+            default  { [ConsoleColor]::Gray }
+        }
+        if ($row.Status -eq 'warn' -or $row.Status -eq 'failed') { $bad++ }
+        $label = switch ($row.Status) {
+            'ok'     { 'OK' }
+            'fixed'  { 'FIXED' }
+            'warn'   { 'CHECK' }
+            'failed' { 'FAILED' }
+            default  { $row.Status }
+        }
+        Write-Host ("  {0,-16} {1,-7} {2}" -f $row.Name, $label, $row.Detail) -ForegroundColor $color
+    }
+    Write-Host ''
+    if ($bad -eq 0) {
+        Write-Host 'Everything looks good.' -ForegroundColor Green
+    } else {
+        Write-Host ("{0} item(s) need attention - see the lines marked CHECK or FAILED above." -f $bad) -ForegroundColor Yellow
+    }
+    Wait-Enter
+}
+
 function Show-DiagnosticsMenu {
     while ($true) {
         $active = @(Get-ActiveNetworkProfiles)
@@ -3204,6 +3591,7 @@ function Show-DiagnosticsMenu {
         if ($active.Count -eq 0) { $netLabel = 'Network: not connected' }
         elseif ($public.Count -gt 0) { $netLabel = "Network: $($public[0].NetworkCategory), make Private" }
         $pick = Read-ArrowMenu -Title 'Diagnostics' -Lines @('Repair, upgrade, and logs. Everyday send and receive stay on the main menu.') -Items @(
+            'Check and fix (one click)',
             'Status',
             'Repair',
             'Upgrade',
@@ -3214,19 +3602,20 @@ function Show-DiagnosticsMenu {
             'Chat log'
         ) -ZeroLabel 'Back'
         switch ($pick) {
-            0 { Show-Status }
-            1 { Show-RepairScreen }
-            2 { Show-UpgradeScreen }
-            3 { Invoke-RemoveSlip }
-            4 { Rename-ThisPc }
-            5 {
+            0 { Show-SelfHealScreen }
+            1 { Show-Status }
+            2 { Show-RepairScreen }
+            3 { Show-UpgradeScreen }
+            4 { Invoke-RemoveSlip }
+            5 { Rename-ThisPc }
+            6 {
                 Clear-Host
                 Write-Host 'Network type' -ForegroundColor Cyan
                 [void](Invoke-MakeNetworkPrivate)
                 Wait-Enter
             }
-            6 { Open-DebugFolder }
-            7 { Show-ChatLog }
+            7 { Open-DebugFolder }
+            8 { Show-ChatLog }
             default { return }
         }
     }
@@ -3413,6 +3802,7 @@ function Get-EntryOptions {
         Room = $null
         PeerName = $null
         OpeningB64 = $null
+        PeopleB64 = $null
         Paths = @()
     }
     if ($env:SLIP_ENTRY) { $o.Entry = $env:SLIP_ENTRY }
@@ -3430,6 +3820,7 @@ function Get-EntryOptions {
         elseif ($token -eq 'listen') { $o.Entry = 'listen' }
         elseif ($token -eq 'chatlisten') { $o.Entry = 'chatlisten' }
         elseif ($token -eq 'chatjoin') { $o.Entry = 'chatjoin' }
+        elseif ($token -eq 'chathost') { $o.Entry = 'chathost' }
         elseif ($token -eq 'install' -or $token -eq 'setup') { $o.Entry = 'install' }
         elseif ($token -eq 'upgrade' -or $token -eq 'update' -or $token -eq 'migrate' -or $token -eq 'repair') { $o.Entry = 'upgrade' }
         elseif ($token -eq '-Address' -and ($i + 1) -lt $pending.Count) { $i++; $o.Address = [string]$pending[$i] }
@@ -3445,6 +3836,7 @@ function Get-EntryOptions {
         elseif ($token -eq '-Room' -and ($i + 1) -lt $pending.Count) { $i++; $o.Room = [string]$pending[$i] }
         elseif ($token -eq '-PeerName' -and ($i + 1) -lt $pending.Count) { $i++; $o.PeerName = [string]$pending[$i] }
         elseif ($token -eq '-OpeningB64' -and ($i + 1) -lt $pending.Count) { $i++; $o.OpeningB64 = [string]$pending[$i] }
+        elseif ($token -eq '-PeopleB64' -and ($i + 1) -lt $pending.Count) { $i++; $o.PeopleB64 = [string]$pending[$i] }
         elseif ($token -like '-*') { }
         else { $paths += $token }
         $i++
@@ -3600,10 +3992,34 @@ switch ($script:Opt.Entry) {
             $wait = $client.BeginConnect($script:Opt.Address, [int]$script:Opt.Port, $null, $null)
             if (-not $wait.AsyncWaitHandle.WaitOne(5000, $false)) { throw 'chat closed' }
             $client.EndConnect($wait)
-            Show-ChatSession -Room $script:Opt.Room -Title $from -Stream $client.GetStream() -OpeningFrom $from -OpeningText $text
+            Show-ChatSession -Room $script:Opt.Room -Title $from -Stream $client.GetStream() -Client $client -OpeningFrom $from -OpeningText $text
             Exit-Slip 0
         } catch {
             Write-Host 'chat closed' -ForegroundColor DarkGray
+            Exit-Slip 1
+        }
+    }
+    'chathost' {
+        try {
+            $people = @()
+            if ($script:Opt.PeopleB64) {
+                $json = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($script:Opt.PeopleB64))
+                $people = @(ConvertFrom-Json $json)
+            }
+            $text = ''
+            if ($script:Opt.OpeningB64) { $text = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($script:Opt.OpeningB64)) }
+            if ($people.Count -gt 0 -and $text) {
+                Start-ChatWith -People $people -Text $text
+            } else {
+                Write-Host 'Nothing to chat.' -ForegroundColor Yellow
+            }
+            Write-Host ''
+            Write-Host 'Chat closed. Press Enter to close this window.' -ForegroundColor DarkGray
+            [void](Read-Host)
+            Exit-Slip 0
+        } catch {
+            Write-Host 'chat closed' -ForegroundColor DarkGray
+            [void](Read-Host)
             Exit-Slip 1
         }
     }
