@@ -3,6 +3,13 @@
 Internal handoff log for Cursor agents and plugins. Newest entries first.
 Read before editing; append after substantive changes.
 
+## 2026-10-01 - publish Slip 0.0.5
+
+- **Why:** an open Slip menu needs a port that can turn on Quick receive and Auto chat from another PC
+- **Changes:** replaced `get` with version 0.0.5. The OPEN beacon includes that control port. `ENABLE quick` and `ENABLE chat` are the only remote commands.
+- **Files:** `get`, `AGENT_CHANGELOG.md`
+- **Notes:** A PC still on 0.0.4 advertises OPEN with port 0. Check and fix once, then the other PC can enable both listeners.
+
 ## 2026-09-30 - publish Slip 0.0.4
 
 - **Why:** chat should be one PC at a time, and Check and fix should set the network to Private

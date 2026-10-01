@@ -12,7 +12,7 @@ $script:RawArgs = @($args)
 $script:RuleTcp = "$($script:AppName) TCP"
 $script:RuleUdp = "$($script:AppName) Discovery"
 $script:BeaconPrefix = $script:AppName.ToUpperInvariant() + '1'
-$script:Version = '0.0.4'
+$script:Version = '0.0.5'
 
 function Initialize-SlipSecurityProtocol {
     try {
@@ -2142,20 +2142,64 @@ function Send-PresenceBeacon {
 function Start-PresenceLoop {
     $stopFile = Join-Path $env:TEMP ("{0}-presence-{1}.stop" -f $script:CommandName, $PID)
     if (Test-Path -LiteralPath $stopFile) { Remove-Item -LiteralPath $stopFile -Force }
+    $scriptPath = Get-InstalledScriptPath
+    if (-not (Test-Path -LiteralPath $scriptPath) -and $PSCommandPath) { $scriptPath = $PSCommandPath }
     $ps = [PowerShell]::Create()
     [void]$ps.AddScript({
-        param($StopFile, $Name, $Computer, $Port, $Prefix, $Helpers)
+        param($StopFile, $Name, $Computer, $BeaconPort, $Prefix, $Helpers, $ScriptPath, $PortFirst, $PortLast)
         . ([scriptblock]::Create($Helpers))
-        while (-not (Test-Path -LiteralPath $StopFile)) {
-            $payload = '{0}|OPEN|0|{1}|{2}|0|open' -f $Prefix, $Name, $Computer
-            try { [void](Send-BeaconPayload -Payload $payload -Port $Port) } catch { }
-            $left = 10
-            while ($left -gt 0 -and -not (Test-Path -LiteralPath $StopFile)) {
-                Start-Sleep -Milliseconds 100
-                $left--
+        $listener = $null
+        $ctrl = 0
+        foreach ($candidate in $PortFirst..$PortLast) {
+            $tryListen = $null
+            try {
+                $tryListen = New-Object System.Net.Sockets.TcpListener ([Net.IPAddress]::Any, $candidate)
+                $tryListen.Start()
+                $listener = $tryListen
+                $ctrl = $candidate
+                break
+            } catch {
+                if ($tryListen) { try { $tryListen.Stop() } catch { } }
             }
         }
-    }).AddArgument($stopFile).AddArgument((ConvertTo-BeaconField (Get-DisplayName))).AddArgument((ConvertTo-BeaconField $env:COMPUTERNAME)).AddArgument($script:BeaconPort).AddArgument($script:BeaconPrefix).AddArgument($script:NetHelpers.ToString())
+        try {
+            while (-not (Test-Path -LiteralPath $StopFile)) {
+                $payload = '{0}|OPEN|{1}|{2}|{3}|0|open' -f $Prefix, $ctrl, $Name, $Computer
+                try { [void](Send-BeaconPayload -Payload $payload -Port $BeaconPort) } catch { }
+                if ($listener -and $listener.Pending()) {
+                    $client = $null
+                    try {
+                        $client = $listener.AcceptTcpClient()
+                        $stream = $client.GetStream()
+                        $stream.ReadTimeout = 3000
+                        $reader = New-Object System.IO.StreamReader($stream, [Text.Encoding]::ASCII, $false, 256, $true)
+                        $line = $reader.ReadLine()
+                        $which = ''
+                        if ($line -match '^(?i)ENABLE\s+(chat|quick)$') { $which = $Matches[1].ToLower() }
+                        $reply = "NO`n"
+                        if ($which) {
+                            $entry = if ($which -eq 'chat') { 'enablechat' } else { 'enablequick' }
+                            $arg = '-NoProfile -ExecutionPolicy Bypass -File "{0}" {1}' -f $ScriptPath, $entry
+                            $proc = Start-Process -FilePath powershell.exe -ArgumentList $arg -WindowStyle Hidden -PassThru -Wait
+                            if ($proc.ExitCode -eq 0) { $reply = "OK`n" } else { $reply = "FAIL`n" }
+                        }
+                        $bytes = [Text.Encoding]::ASCII.GetBytes($reply)
+                        $stream.Write($bytes, 0, $bytes.Length)
+                        $stream.Flush()
+                    } catch { }
+                    finally { if ($client) { try { $client.Close() } catch { } } }
+                }
+                $left = 10
+                while ($left -gt 0 -and -not (Test-Path -LiteralPath $StopFile)) {
+                    if ($listener -and $listener.Pending()) { break }
+                    Start-Sleep -Milliseconds 100
+                    $left--
+                }
+            }
+        } finally {
+            if ($listener) { try { $listener.Stop() } catch { } }
+        }
+    }).AddArgument($stopFile).AddArgument((ConvertTo-BeaconField (Get-DisplayName))).AddArgument((ConvertTo-BeaconField $env:COMPUTERNAME)).AddArgument($script:BeaconPort).AddArgument($script:BeaconPrefix).AddArgument($script:NetHelpers.ToString()).AddArgument($scriptPath).AddArgument($script:PortFirst).AddArgument($script:PortLast)
     $handle = $ps.BeginInvoke()
     return @{ PowerShell = $ps; Handle = $handle; StopFile = $stopFile }
 }
@@ -2370,6 +2414,29 @@ function Invoke-QuickUpload {
     }
 }
 
+function Read-SlipRequest {
+    param($Stream)
+    $ms = New-Object System.IO.MemoryStream
+    $one = New-Object byte[] 1
+    $sawLine = $false
+    while ($ms.Length -lt 16384) {
+        $n = $Stream.Read($one, 0, 1)
+        if ($n -le 0) { break }
+        $ms.Write($one, 0, 1)
+        $len = [int]$ms.Length
+        $buffer = $ms.GetBuffer()
+        if (-not $sawLine -and $buffer[$len - 1] -eq 10) {
+            $line = [Text.Encoding]::ASCII.GetString($buffer, 0, $len).Trim()
+            if ($line -match '^(?i)ENABLE\s+(chat|quick)$') {
+                return @{ Kind = 'enable'; Which = $Matches[1].ToLower() }
+            }
+            $sawLine = $true
+        }
+        if ($len -ge 4 -and $buffer[$len - 4] -eq 13 -and $buffer[$len - 3] -eq 10 -and $buffer[$len - 2] -eq 13 -and $buffer[$len - 1] -eq 10) { break }
+    }
+    return @{ Kind = 'http'; Header = [Text.Encoding]::ASCII.GetString($ms.ToArray()) }
+}
+
 function New-SlipTcpListener {
     foreach ($candidate in $script:PortFirst..$script:PortLast) {
         $tryListen = $null
@@ -2418,7 +2485,16 @@ function Start-QuickListener {
                 $stream = $client.GetStream()
                 $stream.ReadTimeout = 20000
                 $stream.WriteTimeout = 20000
-                $headerText = Read-HttpHeaders $stream
+                $request = Read-SlipRequest $stream
+                if ($request.Kind -eq 'enable') {
+                    if ($request.Which -eq 'chat') { Enable-AutoChat -Quiet }
+                    $ack = [Text.Encoding]::ASCII.GetBytes("OK`n")
+                    $stream.Write($ack, 0, $ack.Length)
+                    $stream.Flush()
+                    Write-TransferDebug 'quick.enable' @{ remote = $remote; which = $request.Which }
+                    continue
+                }
+                $headerText = $request.Header
                 $firstLine = ($headerText -split "`r`n")[0]
                 Write-TransferDebug 'quick.receive.request' @{ remote = $remote; request = $firstLine; port = $port }
                 if ($headerText -notmatch '^POST\s+/quick\s+HTTP/') {
@@ -2980,7 +3056,13 @@ function Start-ChatListener {
                 $stream.ReadTimeout = 5000
                 $reader = New-Object IO.StreamReader($stream, [Text.Encoding]::UTF8, $false, 1024, $true)
                 $line = $reader.ReadLine()
-                if ($line -and $line.StartsWith('INVITE|')) {
+                if ($line -and $line -match '^(?i)ENABLE\s+quick$') {
+                    Enable-QuickReceive -Quiet
+                    $ack = [Text.Encoding]::ASCII.GetBytes("OK`n")
+                    $stream.Write($ack, 0, $ack.Length)
+                    Write-TransferDebug 'chat.enable' @{ remote = $client.Client.RemoteEndPoint.ToString(); which = 'quick' }
+                }
+                elseif ($line -and $line.StartsWith('INVITE|')) {
                     $parts = $line.Split('|')
                     if ($parts.Length -ge 5) {
                         $room = $parts[1]
@@ -3866,6 +3948,8 @@ function Get-EntryOptions {
         elseif ($token -eq 'recv') { $o.Entry = 'recv' }
         elseif ($token -eq 'listen') { $o.Entry = 'listen' }
         elseif ($token -eq 'chatlisten') { $o.Entry = 'chatlisten' }
+        elseif ($token -eq 'enablechat') { $o.Entry = 'enablechat' }
+        elseif ($token -eq 'enablequick') { $o.Entry = 'enablequick' }
         elseif ($token -eq 'chatjoin') { $o.Entry = 'chatjoin' }
         elseif ($token -eq 'chathost') { $o.Entry = 'chathost' }
         elseif ($token -eq 'install' -or $token -eq 'setup') { $o.Entry = 'install' }
@@ -4029,6 +4113,24 @@ switch ($script:Opt.Entry) {
     'listen' {
         try {
             Start-QuickListener
+            Exit-Slip 0
+        } catch {
+            [Console]::Error.WriteLine($_.Exception.Message)
+            Exit-Slip 1
+        }
+    }
+    'enablechat' {
+        try {
+            Enable-AutoChat -Quiet
+            Exit-Slip 0
+        } catch {
+            [Console]::Error.WriteLine($_.Exception.Message)
+            Exit-Slip 1
+        }
+    }
+    'enablequick' {
+        try {
+            Enable-QuickReceive -Quiet
             Exit-Slip 0
         } catch {
             [Console]::Error.WriteLine($_.Exception.Message)
