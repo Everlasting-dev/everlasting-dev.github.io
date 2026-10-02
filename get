@@ -12,7 +12,7 @@ $script:RawArgs = @($args)
 $script:RuleTcp = "$($script:AppName) TCP"
 $script:RuleUdp = "$($script:AppName) Discovery"
 $script:BeaconPrefix = $script:AppName.ToUpperInvariant() + '1'
-$script:Version = '0.0.5'
+$script:Version = '0.0.9'
 
 function Initialize-SlipSecurityProtocol {
     try {
@@ -33,6 +33,8 @@ function Get-NamePath { Join-Path (Get-SlipRoot) 'name.txt' }
 function Get-InstalledPath { Join-Path (Get-SlipRoot) 'installed.txt' }
 function Get-QuickTaskName { "$($script:AppName) Quick Receive" }
 function Get-QuickRunName { "$($script:AppName)QuickReceive" }
+function Get-RemoteHelpRunName { "$($script:AppName)RemoteHelp" }
+function Get-UpdateReminderTaskName { "$($script:AppName) Update Reminder" }
 
 function Test-SlipInstalled {
     Test-Path -LiteralPath (Get-InstalledPath)
@@ -332,6 +334,11 @@ function ConvertTo-BeaconField {
 
 function Get-HowToText {
 @"
+Fastest send (the receiving PC has Quick receive on)
+  1. In Explorer, right-click the files or folder.
+  2. Choose Send to, then $($script:AppName).
+  3. With one receiving PC, it sends immediately. With several, pick one.
+
 On a PC that has internet, open PowerShell and paste:
   powershell -NoProfile -ExecutionPolicy Bypass -Command "`$p=Join-Path `$env:TEMP '$($script:CommandName)-get.ps1'; Remove-Item -LiteralPath `$p -Force -ErrorAction SilentlyContinue; try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }; Invoke-RestMethod -Uri '$($script:SourceUrl)' -OutFile `$p -ErrorAction Stop; & `$p"
 Choose [2] Get $($script:AppName).
@@ -544,6 +551,38 @@ function Get-InstalledScriptPath {
     Join-Path (Get-SlipCommandDir) "$($script:CommandName)-host.ps1"
 }
 
+function Get-SendToShortcutPath {
+    if (-not $env:APPDATA) { return $null }
+    return (Join-Path (Join-Path $env:APPDATA 'Microsoft\Windows\SendTo') "$($script:AppName).lnk")
+}
+
+function Install-SendToShortcut {
+    $path = Get-SendToShortcutPath
+    if (-not $path) { return $false }
+    try {
+        $dir = Split-Path -Parent $path
+        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+        $powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut($path)
+        $shortcut.TargetPath = $powershell
+        $shortcut.Arguments = '-NoProfile -ExecutionPolicy Bypass -File "{0}" sendto' -f (Get-InstalledScriptPath)
+        $shortcut.WorkingDirectory = Get-SlipCommandDir
+        $shortcut.WindowStyle = 1
+        $shortcut.Description = "Send selected files with $($script:AppName)"
+        $shortcut.IconLocation = "$env:SystemRoot\System32\shell32.dll,146"
+        $shortcut.Save()
+        return (Test-Path -LiteralPath $path)
+    } catch {
+        Write-SlipLog "Send To shortcut failed: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Remove-SendToShortcut {
+    $path = Get-SendToShortcutPath
+    if ($path) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
+}
+
 function Remove-LegacySlipArtifacts {
     $dir = Get-SlipCommandDir
     $current = ''
@@ -643,8 +682,11 @@ exit /b %SLIP_ERR%
     $drop = @($dir.TrimEnd('\').ToLowerInvariant(), $shim.TrimEnd('\').ToLowerInvariant())
     $parts = @($userPath -split ';' | Where-Object { $_ -and ($drop -notcontains $_.Trim().TrimEnd('\').ToLowerInvariant()) })
     $parts += $shim
-    [Environment]::SetEnvironmentVariable('Path', ($parts -join ';'), 'User')
-    Send-EnvironmentChanged
+    $updatedUserPath = $parts -join ';'
+    if ($updatedUserPath -cne $userPath) {
+        [Environment]::SetEnvironmentVariable('Path', $updatedUserPath, 'User')
+        Send-EnvironmentChanged
+    }
     if ($env:Path -notlike "*$shim*") { $env:Path = "$shim;$env:Path" }
     $invokeTemplate = @'
 function global:__COMMAND__ {
@@ -672,9 +714,11 @@ function global:__COMMAND__ {
     $invoke = $invokeTemplate.Replace('__COMMAND__', $script:CommandName).Replace('__SOURCE_URL__', ($script:SourceUrl -replace "'", "''")).Replace('__INSTALLED_SCRIPT__', ($installedScript -replace "'", "''"))
     Invoke-Expression $invoke
     Remove-LegacySlipArtifacts
+    [void](Install-SendToShortcut)
 }
 
 function Remove-SlipCommand {
+    Remove-SendToShortcut
     $dir = Get-SlipCommandDir
     $shim = Get-SlipShimDir
     foreach ($name in @("$($script:CommandName).cmd", "$($script:CommandName)-listen.cmd", "$($script:CommandName).ps1", "$($script:CommandName)-host.ps1")) {
@@ -861,8 +905,10 @@ function Invoke-UnattendedUpgrade {
     }
     Write-SlipLog "Upgrade applying fetched payload. version=$($script:Version) source=$($script:SourceUrl)."
     $quickShouldRun = $QuickReceive -or (Test-QuickReceive)
+    $remoteHelpShouldRun = Test-RemoteHelp
     Stop-QuickReceive
     Stop-AutoChat
+    Stop-RemoteHelp -KeepSetting
     $ok = Complete-SlipSetup -DisplayName $name -Quiet:$Quiet -NoPrompt -MakeNetworkPrivate:$MakeNetworkPrivate
     Enable-AutoChat -Quiet:$Quiet
     if ($quickShouldRun) {
@@ -871,7 +917,9 @@ function Invoke-UnattendedUpgrade {
         Remove-QuickReceiveTask
         Remove-QuickReceiveRunKey
     }
-    Write-SlipLog "Upgrade completed. version=$($script:Version) setupOk=$([bool]$ok) quickReceive=$([bool]$quickShouldRun) autoChat=true."
+    if ($remoteHelpShouldRun) { Enable-RemoteHelp -Quiet }
+    if ((Get-UpdateReminderState).Enabled) { [void](Register-UpdateReminderTask) }
+    Write-SlipLog "Upgrade completed. version=$($script:Version) setupOk=$([bool]$ok) quickReceive=$([bool]$quickShouldRun) autoChat=true remoteHelp=$([bool]$remoteHelpShouldRun)."
     if (-not $Quiet) {
         Write-Host "$($script:AppName) $($script:Version) is installed." -ForegroundColor Green
         Write-Host ("Shown as: {0}" -f (Get-DisplayName))
@@ -1022,6 +1070,14 @@ function Show-RepairScreen {
         } else {
             Stop-AutoChat
         }
+        if (Test-RemoteHelp) {
+            Enable-RemoteHelp -Quiet
+            Write-Host 'Remote help startup refreshed.' -ForegroundColor Green
+        }
+        if ((Get-UpdateReminderState).Enabled) {
+            if (Register-UpdateReminderTask) { Write-Host 'Update reminder refreshed.' -ForegroundColor Green }
+            else { Write-Host 'Update reminder could not be refreshed.' -ForegroundColor Yellow }
+        }
         Write-Host 'Repair finished. Your Outbox and Inbox files are still there.' -ForegroundColor Green
         Write-Host "Type $($script:CommandName) in this window. It runs even when Windows is set to block scripts." -ForegroundColor Green
     }
@@ -1041,6 +1097,8 @@ function Invoke-RemoveSlip {
     Remove-SlipCommand
     Stop-QuickReceive
     Stop-AutoChat
+    Stop-RemoteHelp -ForgetSecret
+    Remove-UpdateReminderTask
     if ((Test-FirewallRule $script:RuleTcp) -or (Test-FirewallRule $script:RuleUdp)) {
         if (Test-IsAdmin) {
             Uninstall-FirewallRules
@@ -1118,6 +1176,27 @@ function Show-Status {
     }
     Write-Host ''
     Show-QuickReceiveStatus
+    $remoteState = Get-ListenerReport -PidPath (Get-RemoteHelpPidPath) -PortPath (Get-RemoteHelpPortPath) -Enabled (Test-RemoteHelp)
+    if ($remoteState.Enabled -and $remoteState.Running) {
+        Write-Host ("Remote help: on, listening on port {0}" -f $remoteState.Port) -ForegroundColor Green
+    } elseif ($remoteState.Enabled) {
+        Write-Host 'Remote help: on, but its listener is not running' -ForegroundColor Yellow
+    } else {
+        Write-Host 'Remote help: off' -ForegroundColor DarkGray
+    }
+    $updateState = Get-UpdateReminderState
+    if ($updateState.Enabled -and (Test-UpdateReminderTask)) {
+        Write-Host ("Updates:     reminder daily at {0}" -f $updateState.Time) -ForegroundColor Green
+    } elseif ($updateState.Enabled) {
+        Write-Host 'Updates:     reminder is on, but its Windows task is missing' -ForegroundColor Yellow
+    } else {
+        Write-Host 'Updates:     reminders off' -ForegroundColor DarkGray
+    }
+    if (Test-Path -LiteralPath (Get-SendToShortcutPath)) {
+        Write-Host 'Send to:     Explorer shortcut present' -ForegroundColor Green
+    } else {
+        Write-Host 'Send to:     Explorer shortcut missing; use Repair' -ForegroundColor Yellow
+    }
     Write-Host ''
     Write-Host ("Transfer log: {0}" -f (Get-TransferDebugPath))
     Wait-Enter
@@ -1824,6 +1903,93 @@ function Show-SendFiles {
         Wait-Enter
         return
         }
+    }
+}
+
+function Get-QuickReceiveTargets {
+    $mine = @(Get-LanIPv4 -IncludeVirtual)
+    try {
+        return @(Receive-Beacons -Seconds 3 | Where-Object {
+            $_.Token -eq 'QUICK' -and $_.Port -gt 0 -and ($mine -notcontains $_.IP)
+        } | Sort-Object Display, Windows, IP)
+    } catch { return @() }
+}
+
+function Show-SendToSlip {
+    param([string[]]$Paths)
+    Clear-Host
+    Write-Host 'Send with Slip' -ForegroundColor Cyan
+    Write-Host ''
+    $items = @()
+    $seen = @{}
+    foreach ($path in @($Paths)) {
+        if ([string]::IsNullOrWhiteSpace($path)) { continue }
+        try {
+            $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+            $key = $item.FullName.ToLowerInvariant()
+            if (-not $seen.ContainsKey($key)) {
+                $seen[$key] = $true
+                $items += $item
+            }
+        } catch {
+            Write-Host ("Skipped missing item: {0}" -f $path) -ForegroundColor Yellow
+        }
+    }
+    if ($items.Count -eq 0) {
+        Write-Host 'No file or folder was selected.' -ForegroundColor Yellow
+        Wait-Enter
+        return $false
+    }
+    $total = 0L
+    foreach ($item in $items) { $total += Get-TreeSize $item }
+    foreach ($item in $items) { Write-Host ("  {0}" -f $item.Name) }
+    if ($items.Count -gt 1 -or @($items | Where-Object { $_.PSIsContainer }).Count -gt 0) {
+        Write-Host ("  {0} item(s), {1}; sent as one zip" -f $items.Count, (Format-ByteSize $total)) -ForegroundColor DarkGray
+    } else {
+        Write-Host ("  {0}" -f (Format-ByteSize $total)) -ForegroundColor DarkGray
+    }
+    Write-Host ''
+    Write-Host 'Looking for PCs with Quick receive...'
+    $targets = @(Get-QuickReceiveTargets)
+    if ($targets.Count -eq 0) {
+        Write-Host ''
+        Write-Host 'No PC with Quick receive was found.' -ForegroundColor Yellow
+        Write-Host 'On the receiving PC: Slip > More > Quick receive: On.'
+        Write-Host 'Both PCs must be on the same trusted Private network.' -ForegroundColor DarkGray
+        Wait-Enter
+        return $false
+    }
+    if ($targets.Count -eq 1) {
+        $target = $targets[0]
+        Write-Host ("Found {0} ({1}). Sending now." -f $target.Display, $target.Windows) -ForegroundColor Green
+    } else {
+        $labels = @($targets | ForEach-Object { "{0} ({1})  {2}" -f $_.Display, $_.Windows, $_.IP })
+        $pick = Read-ArrowMenu -Title 'Send with Slip' -Lines @(
+            ("{0} item(s), {1}" -f $items.Count, (Format-ByteSize $total)),
+            'Pick the PC that should receive them.'
+        ) -Items $labels -ZeroLabel 'Cancel'
+        if ($pick -lt 0) { return $false }
+        $target = $targets[$pick]
+    }
+    $payload = $null
+    try {
+        Write-Host ''
+        Write-Host 'Preparing the transfer...' -ForegroundColor DarkGray
+        Write-TransferDebug 'send.sendto.prepare' @{ items = $items.Count; total = $total; target = $target.Display }
+        $payload = New-SendPayload $items
+        Invoke-QuickUpload -Address $target.IP -Port $target.Port -FilePath $payload.Path -DownloadName $payload.Name -TargetName $target.Display
+        Write-Host ''
+        Write-Host 'Done. This window will close.' -ForegroundColor Green
+        Start-Sleep -Seconds 2
+        return $true
+    } catch {
+        Write-TransferDebug 'send.sendto.failed' @{ error = $_.Exception.Message; target = $target.Display }
+        Write-Host ''
+        Write-Host $_.Exception.Message -ForegroundColor Red
+        Wait-Enter
+        return $false
+    } finally {
+        if ($payload -and $payload.Temp) { Remove-Item -LiteralPath $payload.Temp -Force -ErrorAction SilentlyContinue }
     }
 }
 
@@ -2829,6 +2995,26 @@ function Set-AutoChatFlag {
     Set-Content -LiteralPath (Get-ChatFlagPath) -Value $value -Encoding ASCII
 }
 
+function Test-AutoChatListenerAlive {
+    $chatPid = 0
+    $path = Get-ChatPidPath
+    if (Test-Path -LiteralPath $path) {
+        [void][int]::TryParse((Get-Content -LiteralPath $path -Raw -ErrorAction SilentlyContinue).Trim(), [ref]$chatPid)
+    }
+    return ($chatPid -gt 0 -and $null -ne (Get-Process -Id $chatPid -ErrorAction SilentlyContinue))
+}
+
+function Start-AutoChatListener {
+    $scriptPath = Get-InstalledScriptPath
+    if (-not (Test-Path -LiteralPath $scriptPath)) { return $false }
+    Remove-Item -LiteralPath (Get-ChatPidPath) -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath (Get-ChatPortPath) -Force -ErrorAction SilentlyContinue
+    $arg = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`" chatlisten"
+    $proc = Start-Process -FilePath powershell.exe -ArgumentList $arg -WindowStyle Hidden -PassThru
+    Write-TransferDebug 'chat.auto.started' @{ pid = $proc.Id; script = $scriptPath }
+    return $true
+}
+
 function Protect-ChatText {
     param([string]$Text)
     Add-Type -AssemblyName System.Security
@@ -2974,18 +3160,10 @@ function Enable-AutoChat {
         if (-not (Test-Path -LiteralPath $runPath)) { New-Item -Path $runPath -Force | Out-Null }
         New-ItemProperty -LiteralPath $runPath -Name (Get-ChatRunName) -Value $value -PropertyType String -Force | Out-Null
     } catch { }
-    $alive = $false
-    if (Test-Path -LiteralPath (Get-ChatPidPath)) {
-        $chatPid = 0
-        if ([int]::TryParse((Get-Content -LiteralPath (Get-ChatPidPath) -Raw -ErrorAction SilentlyContinue).Trim(), [ref]$chatPid)) {
-            $alive = $null -ne (Get-Process -Id $chatPid -ErrorAction SilentlyContinue)
-        }
-    }
-    if (-not $alive) {
-        $arg = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`" chatlisten"
-        $proc = Start-Process -FilePath powershell.exe -ArgumentList $arg -WindowStyle Hidden -PassThru
-        Write-TransferDebug 'chat.auto.started' @{ pid = $proc.Id; script = $scriptPath }
+    if (-not (Test-AutoChatListenerAlive)) {
+        [void](Start-AutoChatListener)
     } else {
+        $chatPid = [int](Get-Content -LiteralPath (Get-ChatPidPath) -Raw -ErrorAction SilentlyContinue)
         Write-TransferDebug 'chat.auto.alive' @{ pid = $chatPid; script = $scriptPath }
     }
     if (-not $Quiet) {
@@ -3025,7 +3203,8 @@ function Set-AutoChat {
 function Ensure-AutoChat {
     if (-not (Test-AutoChat)) { return }
     if (-not (Test-SlipInstalled)) { return }
-    Enable-AutoChat -Quiet
+    if (Test-AutoChatListenerAlive) { return }
+    [void](Start-AutoChatListener)
 }
 
 function Start-ChatListener {
@@ -3088,6 +3267,373 @@ function Start-ChatListener {
         Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $portFile -Force -ErrorAction SilentlyContinue
         Write-TransferDebug 'chat.listener.stopped' @{ port = $port; pid = $PID }
+    }
+}
+
+function Get-RemoteHelpFlagPath { Join-Path (Get-SlipRoot) 'remote-help.txt' }
+function Get-RemoteHelpSecretPath { Join-Path (Get-SlipCommandDir) 'remote-help.key' }
+function Get-RemoteHelpPidPath { Join-Path (Get-SlipCommandDir) 'remote-help.pid' }
+function Get-RemoteHelpPortPath { Join-Path (Get-SlipCommandDir) 'remote-help.port' }
+
+function Test-RemoteHelp {
+    $path = Get-RemoteHelpFlagPath
+    if (-not (Test-Path -LiteralPath $path)) { return $false }
+    return ((Get-Content -LiteralPath $path -Raw -ErrorAction SilentlyContinue) -match 'on')
+}
+
+function ConvertTo-HexString {
+    param([byte[]]$Bytes)
+    return (($Bytes | ForEach-Object { $_.ToString('X2') }) -join '')
+}
+
+function ConvertFrom-HexString {
+    param([string]$Text)
+    $clean = ($Text -replace '[^0-9A-Fa-f]', '')
+    if (($clean.Length % 2) -ne 0) { throw 'Invalid hexadecimal value.' }
+    $bytes = New-Object byte[] ($clean.Length / 2)
+    for ($index = 0; $index -lt $bytes.Length; $index++) {
+        $bytes[$index] = [Convert]::ToByte($clean.Substring($index * 2, 2), 16)
+    }
+    return $bytes
+}
+
+function Get-RemoteHelpSecret {
+    param([switch]$Create)
+    $path = Get-RemoteHelpSecretPath
+    if (Test-Path -LiteralPath $path) {
+        try {
+            Add-Type -AssemblyName System.Security | Out-Null
+            $protected = [Convert]::FromBase64String((Get-Content -LiteralPath $path -Raw).Trim())
+            return [Security.Cryptography.ProtectedData]::Unprotect($protected, $null, [Security.Cryptography.DataProtectionScope]::CurrentUser)
+        } catch {
+            if (-not $Create) { return $null }
+        }
+    }
+    if (-not $Create) { return $null }
+    $secret = New-Object byte[] 12
+    $rng = New-Object Security.Cryptography.RNGCryptoServiceProvider
+    try { $rng.GetBytes($secret) } finally { $rng.Dispose() }
+    Add-Type -AssemblyName System.Security | Out-Null
+    $protected = [Security.Cryptography.ProtectedData]::Protect($secret, $null, [Security.Cryptography.DataProtectionScope]::CurrentUser)
+    $dir = Split-Path -Parent $path
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+    Set-Content -LiteralPath $path -Value ([Convert]::ToBase64String($protected)) -Encoding ASCII
+    return $secret
+}
+
+function Get-RemoteHelpKey {
+    param([switch]$Create)
+    $secret = Get-RemoteHelpSecret -Create:$Create
+    if (-not $secret) { return $null }
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { return $sha.ComputeHash($secret) } finally { $sha.Dispose() }
+}
+
+function Get-RemoteHelpPairingCode {
+    $secret = Get-RemoteHelpSecret -Create
+    $hex = ConvertTo-HexString $secret
+    return (($hex -split '(.{4})' | Where-Object { $_ }) -join '-')
+}
+
+function Test-FixedTimeBytes {
+    param([byte[]]$Left, [byte[]]$Right)
+    if (-not $Left -or -not $Right -or $Left.Length -ne $Right.Length) { return $false }
+    $different = 0
+    for ($index = 0; $index -lt $Left.Length; $index++) {
+        $different = $different -bor ($Left[$index] -bxor $Right[$index])
+    }
+    return ($different -eq 0)
+}
+
+function Get-HmacBytes {
+    param([byte[]]$Key, [byte[]]$Bytes)
+    $hmac = New-Object Security.Cryptography.HMACSHA256 (,$Key)
+    try { return $hmac.ComputeHash($Bytes) } finally { $hmac.Dispose() }
+}
+
+function Get-RemoteHelpSubkey {
+    param([byte[]]$Key, [string]$Purpose)
+    return (Get-HmacBytes -Key $Key -Bytes ([Text.Encoding]::UTF8.GetBytes("Slip remote help $Purpose")))
+}
+
+function Protect-RemoteHelpResult {
+    param([byte[]]$Key, [string]$Text)
+    $encryptionKey = Get-RemoteHelpSubkey -Key $Key -Purpose 'encryption'
+    $responseKey = Get-RemoteHelpSubkey -Key $Key -Purpose 'response authentication'
+    $aes = [Security.Cryptography.Aes]::Create()
+    try {
+        $aes.Key = $encryptionKey
+        $aes.Mode = [Security.Cryptography.CipherMode]::CBC
+        $aes.Padding = [Security.Cryptography.PaddingMode]::PKCS7
+        $aes.GenerateIV()
+        $plain = [Text.Encoding]::UTF8.GetBytes($Text)
+        $encryptor = $aes.CreateEncryptor()
+        try { $cipher = $encryptor.TransformFinalBlock($plain, 0, $plain.Length) } finally { $encryptor.Dispose() }
+        $signed = New-Object byte[] ($aes.IV.Length + $cipher.Length)
+        [Array]::Copy($aes.IV, 0, $signed, 0, $aes.IV.Length)
+        [Array]::Copy($cipher, 0, $signed, $aes.IV.Length, $cipher.Length)
+        $mac = Get-HmacBytes -Key $responseKey -Bytes $signed
+        return 'RESULT1|{0}|{1}|{2}' -f [Convert]::ToBase64String($aes.IV), [Convert]::ToBase64String($cipher), (ConvertTo-HexString $mac)
+    } finally { $aes.Dispose() }
+}
+
+function Read-RemoteHelpLine {
+    param($Stream, [int]$Maximum = 4096)
+    $memory = New-Object IO.MemoryStream
+    $one = New-Object byte[] 1
+    try {
+        while ($memory.Length -lt $Maximum) {
+            $read = $Stream.Read($one, 0, 1)
+            if ($read -le 0) { break }
+            if ($one[0] -eq 10) { break }
+            if ($one[0] -ne 13) { $memory.WriteByte($one[0]) }
+        }
+        return [Text.Encoding]::UTF8.GetString($memory.ToArray())
+    } finally { $memory.Dispose() }
+}
+
+function Get-ListenerReport {
+    param([string]$PidPath, [string]$PortPath, [bool]$Enabled)
+    $listenerPid = 0
+    $port = 0
+    if (Test-Path -LiteralPath $PidPath) {
+        [void][int]::TryParse((Get-Content -LiteralPath $PidPath -Raw -ErrorAction SilentlyContinue).Trim(), [ref]$listenerPid)
+    }
+    if (Test-Path -LiteralPath $PortPath) {
+        [void][int]::TryParse((Get-Content -LiteralPath $PortPath -Raw -ErrorAction SilentlyContinue).Trim(), [ref]$port)
+    }
+    return [ordered]@{
+        Enabled = $Enabled
+        Running = ($listenerPid -gt 0 -and $null -ne (Get-Process -Id $listenerPid -ErrorAction SilentlyContinue))
+        Pid = $listenerPid
+        Port = $port
+    }
+}
+
+function Get-RecentRemoteHelpLog {
+    param([string]$Path, [int]$Count = 15)
+    if (-not (Test-Path -LiteralPath $Path)) { return @() }
+    try { return @(Get-Content -LiteralPath $Path -Tail $Count -ErrorAction Stop) } catch { return @() }
+}
+
+function Get-RemoteHelpReport {
+    $activeProfiles = @(Get-ActiveNetworkProfiles)
+    $publicProfiles = @($activeProfiles | Where-Object { $_.NetworkCategory -ne 'Private' -and $_.NetworkCategory -ne 'DomainAuthenticated' })
+    $networks = @()
+    foreach ($item in $activeProfiles) {
+        $networks += [ordered]@{ Name = [string]$item.Name; Adapter = [string]$item.InterfaceAlias; Category = [string]$item.NetworkCategory }
+    }
+    $osName = [Environment]::OSVersion.VersionString
+    $build = [Environment]::OSVersion.Version.Build
+    try {
+        $current = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction Stop
+        if ($current.ProductName) { $osName = [string]$current.ProductName }
+        if ($current.CurrentBuildNumber) { $build = [string]$current.CurrentBuildNumber }
+    } catch { }
+    $uptimeSeconds = $null
+    try { $uptimeSeconds = [int64]([Environment]::TickCount64 / 1000) } catch {
+        try { $uptimeSeconds = [int64]([uint32][Environment]::TickCount / 1000) } catch { }
+    }
+    $disk = $null
+    try {
+        $drive = Get-PSDrive -Name ([IO.Path]::GetPathRoot($env:SystemRoot).TrimEnd(':\')) -ErrorAction Stop
+        $disk = [ordered]@{ FreeBytes = [int64]$drive.Free; UsedBytes = [int64]$drive.Used }
+    } catch { }
+    $quick = Get-ListenerReport -PidPath (Get-ListenPidPath) -PortPath (Get-ListenPortPath) -Enabled (Test-QuickReceive)
+    $chat = Get-ListenerReport -PidPath (Get-ChatPidPath) -PortPath (Get-ChatPortPath) -Enabled (Test-AutoChat)
+    $support = Get-ListenerReport -PidPath (Get-RemoteHelpPidPath) -PortPath (Get-RemoteHelpPortPath) -Enabled (Test-RemoteHelp)
+    $updateState = Get-UpdateReminderState
+    $updateReminder = [ordered]@{
+        Enabled = $updateState.Enabled
+        Time = $updateState.Time
+        TaskPresent = (Test-UpdateReminderTask)
+        LastCheckedUtc = $updateState.LastCheckedUtc
+        LastNotifiedVersion = $updateState.LastNotifiedVersion
+    }
+    $sendToShortcut = Test-Path -LiteralPath (Get-SendToShortcutPath)
+    $firewallTcp = Test-FirewallRule $script:RuleTcp
+    $firewallUdp = Test-FirewallRule $script:RuleUdp
+    $findings = New-Object Collections.Generic.List[string]
+    if ($activeProfiles.Count -eq 0) { $findings.Add('No active physical network profile was found.') }
+    elseif ($publicProfiles.Count -gt 0) { $findings.Add('The active network is Public; Slip inbound rules only apply on Private networks.') }
+    if (-not $firewallTcp) { $findings.Add("Firewall rule '$($script:RuleTcp)' is missing.") }
+    if (-not $firewallUdp) { $findings.Add("Firewall rule '$($script:RuleUdp)' is missing.") }
+    if ($quick.Enabled -and -not $quick.Running) { $findings.Add('Quick receive is enabled but its listener is not running.') }
+    if ($chat.Enabled -and -not $chat.Running) { $findings.Add('Auto chat is enabled but its listener is not running.') }
+    if ($updateReminder.Enabled -and -not $updateReminder.TaskPresent) { $findings.Add('Update reminders are enabled but their Windows task is missing.') }
+    if (-not $sendToShortcut) { $findings.Add('The Windows Send to -> Slip shortcut is missing.') }
+    if ($disk -and $disk.FreeBytes -lt 2GB) { $findings.Add('The Windows drive has less than 2 GB free.') }
+    if ($findings.Count -eq 0) { $findings.Add('No obvious Slip or network problem was found.') }
+    return [ordered]@{
+        Protocol = 1
+        GeneratedUtc = [DateTime]::UtcNow.ToString('o')
+        Computer = [ordered]@{ DisplayName = (Get-DisplayName); WindowsName = $env:COMPUTERNAME; User = $env:USERNAME }
+        Slip = [ordered]@{
+            Version = $script:Version
+            Installed = (Test-SlipInstalled)
+            FirewallTcp = $firewallTcp
+            FirewallUdp = $firewallUdp
+            QuickReceive = $quick
+            AutoChat = $chat
+            RemoteHelp = $support
+            UpdateReminder = $updateReminder
+            SendToShortcut = $sendToShortcut
+        }
+        Windows = [ordered]@{ Product = $osName; Build = $build; PowerShell = [string]$PSVersionTable.PSVersion; UptimeSeconds = $uptimeSeconds }
+        Network = [ordered]@{ Addresses = @(Get-LanIPv4); Profiles = $networks }
+        Disk = $disk
+        Findings = @($findings)
+        Logs = [ordered]@{
+            Slip = (@(Get-RecentRemoteHelpLog -Path (Join-Path (Get-DebugPath) "$($script:CommandName).log")) -join "`n")
+            Transfer = (@(Get-RecentRemoteHelpLog -Path (Get-TransferDebugPath)) -join "`n")
+        }
+    }
+}
+
+function Get-RemoteHelpCommandLine {
+    $scriptPath = Get-InstalledScriptPath
+    return "`"powershell.exe`" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`" remotehelp"
+}
+
+function Test-RemoteHelpListenerAlive {
+    $listenerPid = 0
+    $path = Get-RemoteHelpPidPath
+    if (Test-Path -LiteralPath $path) {
+        [void][int]::TryParse((Get-Content -LiteralPath $path -Raw -ErrorAction SilentlyContinue).Trim(), [ref]$listenerPid)
+    }
+    return ($listenerPid -gt 0 -and $null -ne (Get-Process -Id $listenerPid -ErrorAction SilentlyContinue))
+}
+
+function Set-RemoteHelpRunKey {
+    $runPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+    if (-not (Test-Path -LiteralPath $runPath)) { New-Item -Path $runPath -Force | Out-Null }
+    New-ItemProperty -LiteralPath $runPath -Name (Get-RemoteHelpRunName) -Value (Get-RemoteHelpCommandLine) -PropertyType String -Force | Out-Null
+}
+
+function Enable-RemoteHelp {
+    param([switch]$Quiet)
+    Ensure-SlipFiles | Out-Null
+    [void](Get-RemoteHelpSecret -Create)
+    Set-Content -LiteralPath (Get-RemoteHelpFlagPath) -Value 'on' -Encoding ASCII
+    Install-SlipCommand
+    Set-RemoteHelpRunKey
+    if (-not (Test-RemoteHelpListenerAlive)) {
+        $scriptPath = Get-InstalledScriptPath
+        $arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`" remotehelp"
+        Start-Process -FilePath powershell.exe -ArgumentList $arguments -WindowStyle Hidden | Out-Null
+    }
+    if (-not $Quiet) { Write-Host 'Remote help is on.' -ForegroundColor Green }
+}
+
+function Ensure-RemoteHelp {
+    if (-not (Test-RemoteHelp) -or (Test-RemoteHelpListenerAlive)) { return }
+    $scriptPath = Get-InstalledScriptPath
+    if (-not (Test-Path -LiteralPath $scriptPath)) { return }
+    $arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`" remotehelp"
+    Start-Process -FilePath powershell.exe -ArgumentList $arguments -WindowStyle Hidden | Out-Null
+}
+
+function Stop-RemoteHelp {
+    param([switch]$KeepSetting, [switch]$ForgetSecret)
+    if (-not $KeepSetting -and (Test-Path -LiteralPath (Get-RemoteHelpFlagPath))) {
+        Set-Content -LiteralPath (Get-RemoteHelpFlagPath) -Value 'off' -Encoding ASCII
+    }
+    $listenerPid = 0
+    if (Test-Path -LiteralPath (Get-RemoteHelpPidPath)) {
+        [void][int]::TryParse((Get-Content -LiteralPath (Get-RemoteHelpPidPath) -Raw -ErrorAction SilentlyContinue).Trim(), [ref]$listenerPid)
+        if ($listenerPid -gt 0) { Stop-Process -Id $listenerPid -Force -ErrorAction SilentlyContinue }
+    }
+    Remove-Item -LiteralPath (Get-RemoteHelpPidPath) -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath (Get-RemoteHelpPortPath) -Force -ErrorAction SilentlyContinue
+    if (-not $KeepSetting) {
+        Remove-ItemProperty -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name (Get-RemoteHelpRunName) -ErrorAction SilentlyContinue
+    }
+    if ($ForgetSecret) { Remove-Item -LiteralPath (Get-RemoteHelpSecretPath) -Force -ErrorAction SilentlyContinue }
+}
+
+function Start-RemoteHelpListener {
+    if (-not (Test-RemoteHelp)) { return }
+    $key = Get-RemoteHelpKey
+    if (-not $key) { throw 'Remote help pairing key is missing.' }
+    $listener = New-SlipTcpListener
+    $port = ([Net.IPEndPoint]$listener.LocalEndpoint).Port
+    Set-Content -LiteralPath (Get-RemoteHelpPidPath) -Value $PID -Encoding ASCII
+    Set-Content -LiteralPath (Get-RemoteHelpPortPath) -Value $port -Encoding ASCII
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]'
+    Write-TransferDebug 'remote-help.listener.started' @{ port = $port; pid = $PID }
+    try {
+        while (Test-RemoteHelp) {
+            $payload = '{0}|SUPPORT|{1}|{2}|{3}|0|support' -f $script:BeaconPrefix, $port, (ConvertTo-BeaconField (Get-DisplayName)), (ConvertTo-BeaconField $env:COMPUTERNAME)
+            try { [void](Send-BeaconPayload -Payload $payload -Port $script:BeaconPort) } catch { }
+            if (-not $listener.Pending()) { Start-Sleep -Milliseconds 150; continue }
+            $client = $listener.AcceptTcpClient()
+            try {
+                $client.ReceiveTimeout = 5000
+                $client.SendTimeout = 10000
+                $stream = $client.GetStream()
+                $line = Read-RemoteHelpLine -Stream $stream
+                $parts = $line.Split('|')
+                if ($parts.Length -ne 5 -or $parts[0] -ne 'SUPPORT1' -or $parts[3] -ne 'status') { continue }
+                $timestamp = 0L
+                if (-not [int64]::TryParse($parts[1], [ref]$timestamp)) { continue }
+                $now = [int64]([DateTime]::UtcNow - [DateTime]'1970-01-01').TotalSeconds
+                if ([Math]::Abs($now - $timestamp) -gt 120) { continue }
+                $nonce = $parts[2]
+                if ($nonce -notmatch '^[0-9A-Fa-f]{32,64}$' -or $seen.Contains($nonce)) { continue }
+                $provided = ConvertFrom-HexString $parts[4]
+                $canonical = [Text.Encoding]::UTF8.GetBytes(('{0}|{1}|{2}' -f $parts[1], $nonce, $parts[3]))
+                $requestKey = Get-RemoteHelpSubkey -Key $key -Purpose 'request authentication'
+                $expected = Get-HmacBytes -Key $requestKey -Bytes $canonical
+                if (-not (Test-FixedTimeBytes -Left $provided -Right $expected)) { continue }
+                [void]$seen.Add($nonce)
+                if ($seen.Count -gt 500) { $seen.Clear() }
+                $json = (Get-RemoteHelpReport | ConvertTo-Json -Depth 5 -Compress)
+                $reply = (Protect-RemoteHelpResult -Key $key -Text $json) + "`n"
+                $bytes = [Text.Encoding]::UTF8.GetBytes($reply)
+                $stream.Write($bytes, 0, $bytes.Length)
+                $stream.Flush()
+                Write-TransferDebug 'remote-help.status.sent' @{ remote = [string]$client.Client.RemoteEndPoint; bytes = $bytes.Length }
+            } catch {
+                Write-TransferDebug 'remote-help.request.failed' @{ error = $_.Exception.Message }
+            } finally { try { $client.Close() } catch { } }
+        }
+    } finally {
+        try { $listener.Stop() } catch { }
+        Remove-Item -LiteralPath (Get-RemoteHelpPidPath) -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath (Get-RemoteHelpPortPath) -Force -ErrorAction SilentlyContinue
+        Write-TransferDebug 'remote-help.listener.stopped' @{ port = $port; pid = $PID }
+    }
+}
+
+function Show-RemoteHelpScreen {
+    Clear-Host
+    Write-Host 'Remote help' -ForegroundColor Cyan
+    Write-Host ("Version {0}" -f $script:Version) -ForegroundColor DarkGray
+    Write-Host ''
+    Write-Host 'Remote help lets a paired Slip PC request a fixed health report.'
+    Write-Host 'It cannot run commands, browse files, control the desktop, or install software.' -ForegroundColor DarkGray
+    Write-Host 'Reports are authenticated and encrypted. Use this only on a trusted Private network.' -ForegroundColor DarkGray
+    Write-Host ''
+    if (-not (Test-RemoteHelp)) {
+        $answer = Read-Host '[Y] Turn on  [N] Back'
+        if ($answer -notmatch '^[Yy]') { return }
+        Enable-RemoteHelp
+    }
+    Write-Host ''
+    Write-Host 'Pairing code (share once with your other Slip PC):' -ForegroundColor Cyan
+    Write-Host ("  {0}" -f (Get-RemoteHelpPairingCode)) -ForegroundColor Yellow
+    Write-Host ''
+    $answer = Read-Host '[R] Reset code  [O] Turn off  [Enter] Back'
+    if ($answer -match '^[Rr]') {
+        Stop-RemoteHelp -ForgetSecret
+        Enable-RemoteHelp -Quiet
+        Write-Host ''
+        Write-Host ("New pairing code: {0}" -f (Get-RemoteHelpPairingCode)) -ForegroundColor Yellow
+        Wait-Enter
+    } elseif ($answer -match '^[Oo]') {
+        Stop-RemoteHelp
+        Write-Host 'Remote help is off.' -ForegroundColor Green
+        Wait-Enter
     }
 }
 
@@ -3489,13 +4035,214 @@ function Get-OnlineSlipVersion {
     return @{ Version = $ver; Path = $tmp; Bytes = (Get-Item -LiteralPath $tmp).Length }
 }
 
+function Get-UpdateReminderPath { Join-Path (Get-SlipRoot) 'update-reminder.json' }
+
+function Get-UpdateReminderState {
+    $state = [pscustomobject]@{
+        Enabled = $false
+        Time = '18:00'
+        LastCheckedUtc = ''
+        LastNotifiedVersion = ''
+    }
+    $path = Get-UpdateReminderPath
+    if (-not (Test-Path -LiteralPath $path)) { return $state }
+    try {
+        $saved = Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json
+        if ($null -ne $saved.Enabled) { $state.Enabled = [bool]$saved.Enabled }
+        if ([string]$saved.Time -match '^([01]?\d|2[0-3]):[0-5]\d$') { $state.Time = [string]$saved.Time }
+        if ($saved.LastCheckedUtc) { $state.LastCheckedUtc = [string]$saved.LastCheckedUtc }
+        if ($saved.LastNotifiedVersion) { $state.LastNotifiedVersion = [string]$saved.LastNotifiedVersion }
+    } catch { }
+    return $state
+}
+
+function Save-UpdateReminderState {
+    param($State)
+    $root = Get-SlipRoot
+    if (-not (Test-Path -LiteralPath $root)) { New-Item -ItemType Directory -Force -Path $root | Out-Null }
+    $State | ConvertTo-Json -Compress | Set-Content -LiteralPath (Get-UpdateReminderPath) -Encoding UTF8
+}
+
+function Get-UpdateReminderCommandLine {
+    $scriptPath = Get-InstalledScriptPath
+    return "`"powershell.exe`" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`" updatecheck"
+}
+
+function Test-UpdateReminderTask {
+    try {
+        $null = Get-ScheduledTask -TaskName (Get-UpdateReminderTaskName) -ErrorAction Stop
+        return $true
+    } catch { return $false }
+}
+
+function Register-UpdateReminderTask {
+    $state = Get-UpdateReminderState
+    if (-not $state.Enabled) { return $false }
+    try {
+        $arguments = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" updatecheck' -f (Get-InstalledScriptPath)
+        $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $arguments
+        $trigger = New-ScheduledTaskTrigger -Daily -At $state.Time
+        $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+        $userId = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+        $principal = New-ScheduledTaskPrincipal -UserId $userId -LogonType Interactive -RunLevel Limited
+        Register-ScheduledTask -TaskName (Get-UpdateReminderTaskName) -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force -ErrorAction Stop | Out-Null
+    } catch {
+        Write-SlipLog "Update reminder task failed: $($_.Exception.Message)"
+        return $false
+    }
+    Write-SlipLog "Update reminder scheduled daily at $($state.Time)."
+    return $true
+}
+
+function Remove-UpdateReminderTask {
+    Unregister-ScheduledTask -TaskName (Get-UpdateReminderTaskName) -Confirm:$false -ErrorAction SilentlyContinue
+}
+
+function Test-NewerSlipVersion {
+    param([string]$Online, [string]$Installed)
+    try { return ([version]$Online -gt [version]$Installed) } catch { return ($Online -and $Online -ne 'unknown' -and $Online -ne $Installed) }
+}
+
+function Start-UpdateNotice {
+    param([string]$OnlineVersion)
+    $safeVersion = ($OnlineVersion -replace '[^0-9A-Za-z.\-]', '')
+    if (-not $safeVersion) { return }
+    $scriptPath = Get-InstalledScriptPath
+    $inner = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{0}" updatenotice -OnlineVersion {1}' -f $scriptPath, $safeVersion
+    Start-Process -FilePath $env:ComSpec -ArgumentList ('/c title Slip update available & ' + $inner) -WindowStyle Normal | Out-Null
+}
+
+function Invoke-UpdateReminderCheck {
+    param([switch]$Interactive)
+    $state = Get-UpdateReminderState
+    if (-not $Interactive -and -not $state.Enabled) {
+        return [pscustomobject]@{ Status = 'disabled'; Installed = $script:Version; Online = ''; Detail = 'Update reminders are off.' }
+    }
+    $state.LastCheckedUtc = [DateTime]::UtcNow.ToString('o')
+    $online = Get-OnlineSlipVersion
+    if (-not $online) {
+        Save-UpdateReminderState $state
+        return [pscustomobject]@{ Status = 'offline'; Installed = $script:Version; Online = ''; Detail = 'The update site could not be reached.' }
+    }
+    try {
+        if ($online.Version -eq 'unknown') {
+            Save-UpdateReminderState $state
+            return [pscustomobject]@{ Status = 'unknown'; Installed = $script:Version; Online = ''; Detail = 'The online version could not be read.' }
+        }
+        if (Test-NewerSlipVersion -Online $online.Version -Installed $script:Version) {
+            $alreadyNotified = $state.LastNotifiedVersion -eq $online.Version
+            if ($Interactive -or -not $alreadyNotified) { $state.LastNotifiedVersion = $online.Version }
+            Save-UpdateReminderState $state
+            if (-not $Interactive -and -not $alreadyNotified) { Start-UpdateNotice -OnlineVersion $online.Version }
+            return [pscustomobject]@{ Status = 'available'; Installed = $script:Version; Online = $online.Version; Detail = 'An update is available.' }
+        }
+        Save-UpdateReminderState $state
+        return [pscustomobject]@{ Status = 'current'; Installed = $script:Version; Online = $online.Version; Detail = 'Slip is up to date.' }
+    } finally {
+        if ($online.Path) { Remove-Item -LiteralPath $online.Path -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+function Show-UpdateNotice {
+    param([string]$OnlineVersion)
+    Clear-Host
+    Write-Host 'Slip update available' -ForegroundColor Cyan
+    Write-Host ''
+    Write-Host ("Installed: {0}" -f $script:Version)
+    Write-Host ("Available: {0}" -f $OnlineVersion) -ForegroundColor Green
+    Write-Host ''
+    Write-Host 'Open Slip, then choose More > Diagnostics > Check and fix.'
+    Write-Host 'The reminder never installs an update by itself.' -ForegroundColor DarkGray
+    Wait-Enter
+}
+
+function Read-UpdateReminderTime {
+    param([string]$Current)
+    while ($true) {
+        $entered = Read-Host ("Daily check time (24-hour HH:mm, Enter keeps {0})" -f $Current)
+        if ([string]::IsNullOrWhiteSpace($entered)) { return $Current }
+        $parsed = [DateTime]::MinValue
+        $formats = [string[]]@('H:mm', 'HH:mm')
+        if ([DateTime]::TryParseExact($entered.Trim(), $formats, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$parsed)) {
+            return $parsed.ToString('HH:mm')
+        }
+        Write-Host 'Use a time such as 09:30 or 18:00.' -ForegroundColor Yellow
+    }
+}
+
+function Show-UpdateReminderScreen {
+    while ($true) {
+        $state = Get-UpdateReminderState
+        $status = if ($state.Enabled) { "Daily at $($state.Time)" } else { 'Off' }
+        $items = if ($state.Enabled) { @('Check now', 'Change daily time', 'Turn reminders off') } else { @('Check now', 'Turn on daily reminders') }
+        $pick = Read-ArrowMenu -Title 'Update reminders' -Lines @(
+            ("Status: {0}" -f $status),
+            'Checks quietly and only alerts once for each new version.',
+            'Updates are never installed automatically.'
+        ) -Items $items -ZeroLabel 'Back'
+        if ($pick -lt 0) { return }
+        if ($pick -eq 0) {
+            Clear-Host
+            Write-Host 'Checking for updates...' -ForegroundColor Cyan
+            $result = Invoke-UpdateReminderCheck -Interactive
+            Write-Host ''
+            if ($result.Status -eq 'available') {
+                Write-Host ("Slip {0} is available. Installed: {1}." -f $result.Online, $result.Installed) -ForegroundColor Green
+                Write-Host 'Use Diagnostics > Check and fix when you are ready.'
+            } elseif ($result.Status -eq 'current') {
+                Write-Host ("Slip {0} is up to date." -f $result.Installed) -ForegroundColor Green
+            } else {
+                Write-Host $result.Detail -ForegroundColor Yellow
+            }
+            Wait-Enter
+            continue
+        }
+        if (-not $state.Enabled -and $pick -eq 1) {
+            $state.Time = Read-UpdateReminderTime -Current $state.Time
+            $state.Enabled = $true
+            Save-UpdateReminderState $state
+            if (Register-UpdateReminderTask) { Write-Host ("Update reminders are on for {0} daily." -f $state.Time) -ForegroundColor Green }
+            else {
+                $state.Enabled = $false
+                Save-UpdateReminderState $state
+                Write-Host 'Windows did not create the reminder task.' -ForegroundColor Yellow
+            }
+            Wait-Enter
+            continue
+        }
+        if ($state.Enabled -and $pick -eq 1) {
+            $oldTime = $state.Time
+            $state.Time = Read-UpdateReminderTime -Current $state.Time
+            Save-UpdateReminderState $state
+            if (Register-UpdateReminderTask) { Write-Host ("Daily reminder changed to {0}." -f $state.Time) -ForegroundColor Green }
+            else {
+                $state.Time = $oldTime
+                Save-UpdateReminderState $state
+                [void](Register-UpdateReminderTask)
+                Write-Host 'Windows did not update the reminder task. The previous time was kept.' -ForegroundColor Yellow
+            }
+            Wait-Enter
+            continue
+        }
+        if ($state.Enabled -and $pick -eq 2) {
+            $state.Enabled = $false
+            Save-UpdateReminderState $state
+            Remove-UpdateReminderTask
+            Write-Host 'Update reminders are off.' -ForegroundColor Green
+            Wait-Enter
+        }
+    }
+}
+
 function Repair-SlipStartupEntries {
     # Re-writes the command and startup registry entries when they are missing or
     # wrong. Returns the list of things it had to fix.
     $fixed = @()
+    $sendToWasMissing = -not (Test-Path -LiteralPath (Get-SendToShortcutPath))
     # Reinforce like Repair does: recreate folders, refresh the profile and the
     # slip command, then reconcile the startup registry entries below.
     try { Ensure-SlipFiles | Out-Null } catch { try { Install-SlipCommand | Out-Null } catch { } }
+    if ($sendToWasMissing -and (Test-Path -LiteralPath (Get-SendToShortcutPath))) { $fixed += 'Send To shortcut' }
     $runPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
     $scriptPath = Get-InstalledScriptPath
     if (Test-AutoChat) {
@@ -3515,6 +4262,19 @@ function Repair-SlipStartupEntries {
             [void](Set-QuickReceiveRunKey)
             $fixed += 'Quick receive startup'
         }
+    }
+    if (Test-RemoteHelp) {
+        $expected = Get-RemoteHelpCommandLine
+        $have = $null
+        try { $have = [string](Get-ItemPropertyValue -LiteralPath $runPath -Name (Get-RemoteHelpRunName) -ErrorAction Stop) } catch { }
+        if ($have -ne $expected -or -not (Test-RemoteHelpListenerAlive)) {
+            Enable-RemoteHelp -Quiet | Out-Null
+            $fixed += 'Remote help startup'
+        }
+    }
+    $updateState = Get-UpdateReminderState
+    if ($updateState.Enabled -and -not (Test-UpdateReminderTask)) {
+        if (Register-UpdateReminderTask) { $fixed += 'Update reminder task' }
     }
     return @($fixed)
 }
@@ -3747,6 +4507,9 @@ function Show-MoreMenu {
     while ($true) {
         $quickLabel = if (Test-QuickReceive) { 'Quick receive: On' } else { 'Quick receive: Off' }
         $chatLabel = if (Test-AutoChat) { 'Auto chat: On' } else { 'Auto chat: Off' }
+        $remoteLabel = if (Test-RemoteHelp) { 'Remote help: On' } else { 'Remote help: Off' }
+        $updateState = Get-UpdateReminderState
+        $updateLabel = if ($updateState.Enabled) { "Update reminders: Daily $($updateState.Time)" } else { 'Update reminders: Off' }
         $active = @(Get-ActiveNetworkProfiles)
         $public = @(Get-PublicNetworkProfiles)
         $netLabel = if ($active.Count -eq 0) { 'Network: not connected' } elseif ($public.Count -gt 0) { 'Network: Public' } else { 'Network: Private' }
@@ -3754,19 +4517,23 @@ function Show-MoreMenu {
             'Folders',
             'How to send and receive',
             'Check connection',
+            $updateLabel,
             $quickLabel,
             $chatLabel,
             $netLabel,
+            $remoteLabel,
             'Diagnostics'
-        ) -SeparatorsAfter @(2, 5) -ZeroLabel 'Back'
+        ) -SeparatorsAfter @(3, 7) -ZeroLabel 'Back'
         switch ($pick) {
             0 { Show-FoldersMenu }
             1 { Show-HowTo }
             2 { Show-CheckConnection }
-            3 { Set-QuickReceive -On (-not (Test-QuickReceive)) }
-            4 { Set-AutoChat -On (-not (Test-AutoChat)) }
-            5 { Show-NetworkToggle }
-            6 { Show-DiagnosticsMenu }
+            3 { Show-UpdateReminderScreen }
+            4 { Set-QuickReceive -On (-not (Test-QuickReceive)) }
+            5 { Set-AutoChat -On (-not (Test-AutoChat)) }
+            6 { Show-NetworkToggle }
+            7 { Show-RemoteHelpScreen }
+            8 { Show-DiagnosticsMenu }
             default { return }
         }
     }
@@ -3777,6 +4544,7 @@ function Show-SlipMenu {
     $loop = $null
     try {
         Ensure-AutoChat
+        Ensure-RemoteHelp
         $loop = Start-PresenceLoop
         while ($true) {
             $ips = @(Get-LanIPv4)
@@ -3930,6 +4698,7 @@ function Get-EntryOptions {
         PeerName = $null
         OpeningB64 = $null
         PeopleB64 = $null
+        OnlineVersion = $null
         Paths = @()
     }
     if ($env:SLIP_ENTRY) { $o.Entry = $env:SLIP_ENTRY }
@@ -3944,10 +4713,14 @@ function Get-EntryOptions {
         elseif ($token -eq 'netprivate') { $o.Entry = 'netprivate' }
         elseif ($token -eq 'netpublic') { $o.Entry = 'netpublic' }
         elseif ($token -eq 'fixnet') { $o.Entry = 'fixnet' }
+        elseif ($token -eq 'sendto') { $o.Entry = 'sendto' }
         elseif ($token -eq 'serve') { $o.Entry = 'serve' }
         elseif ($token -eq 'recv') { $o.Entry = 'recv' }
         elseif ($token -eq 'listen') { $o.Entry = 'listen' }
         elseif ($token -eq 'chatlisten') { $o.Entry = 'chatlisten' }
+        elseif ($token -eq 'remotehelp') { $o.Entry = 'remotehelp' }
+        elseif ($token -eq 'updatecheck') { $o.Entry = 'updatecheck' }
+        elseif ($token -eq 'updatenotice') { $o.Entry = 'updatenotice' }
         elseif ($token -eq 'enablechat') { $o.Entry = 'enablechat' }
         elseif ($token -eq 'enablequick') { $o.Entry = 'enablequick' }
         elseif ($token -eq 'chatjoin') { $o.Entry = 'chatjoin' }
@@ -3968,6 +4741,7 @@ function Get-EntryOptions {
         elseif ($token -eq '-PeerName' -and ($i + 1) -lt $pending.Count) { $i++; $o.PeerName = [string]$pending[$i] }
         elseif ($token -eq '-OpeningB64' -and ($i + 1) -lt $pending.Count) { $i++; $o.OpeningB64 = [string]$pending[$i] }
         elseif ($token -eq '-PeopleB64' -and ($i + 1) -lt $pending.Count) { $i++; $o.PeopleB64 = [string]$pending[$i] }
+        elseif ($token -eq '-OnlineVersion' -and ($i + 1) -lt $pending.Count) { $i++; $o.OnlineVersion = [string]$pending[$i] }
         elseif ($token -like '-*') { }
         else { $paths += $token }
         $i++
@@ -4079,6 +4853,15 @@ switch ($script:Opt.Entry) {
         try { [void](Set-ActiveNetworksPrivate) } catch { }
         Exit-Slip 0
     }
+    'sendto' {
+        if ($script:Opt.Paths.Count -lt 1) {
+            [Console]::Error.WriteLine('sendto needs at least one file or folder path')
+            Exit-Slip 1
+        } else {
+            $sent = Show-SendToSlip -Paths $script:Opt.Paths
+            if ($sent) { Exit-Slip 0 } else { Exit-Slip 1 }
+        }
+    }
     'serve' {
         if ($script:Opt.Paths.Count -lt 1) {
             [Console]::Error.WriteLine('serve needs a file path')
@@ -4145,6 +4928,29 @@ switch ($script:Opt.Entry) {
             [Console]::Error.WriteLine($_.Exception.Message)
             Exit-Slip 1
         }
+    }
+    'remotehelp' {
+        try {
+            Start-RemoteHelpListener
+            Exit-Slip 0
+        } catch {
+            Write-SlipLog "Remote help listener failed: $($_.Exception.Message)"
+            [Console]::Error.WriteLine($_.Exception.Message)
+            Exit-Slip 1
+        }
+    }
+    'updatecheck' {
+        try {
+            [void](Invoke-UpdateReminderCheck)
+            Exit-Slip 0
+        } catch {
+            Write-SlipLog "Update reminder check failed: $($_.Exception.Message)"
+            Exit-Slip 1
+        }
+    }
+    'updatenotice' {
+        if ($script:Opt.OnlineVersion) { Show-UpdateNotice -OnlineVersion $script:Opt.OnlineVersion }
+        Exit-Slip 0
     }
     'chatjoin' {
         $from = ''

@@ -3,40 +3,141 @@
 Internal handoff log for Cursor agents and plugins. Newest entries first.
 Read before editing; append after substantive changes.
 
-## 2026-10-01 - publish Slip 0.0.5
+## 2026-10-02 - faster normal startup
 
-- **Why:** an open Slip menu needs a port that can turn on Quick receive and Auto chat from another PC
-- **Changes:** replaced `get` with version 0.0.5. The OPEN beacon includes that control port. `ENABLE quick` and `ENABLE chat` are the only remote commands.
-- **Files:** `get`, `AGENT_CHANGELOG.md`
-- **Notes:** A PC still on 0.0.4 advertises OPEN with port 0. Check and fix once, then the other PC can enable both listeners.
+- **Why:** Opening `slip` was delayed because Auto chat ran the full command installation path before drawing every menu, including script hashing, launcher and shortcut rewrites, user PATH work, and a Windows environment broadcast that could wait up to five seconds.
+- **Changes:** Version 0.0.9. Normal menu startup now performs only a fast Auto chat PID health check and starts the listener only when it is missing. Full command, profile, PATH, startup-entry, and Send To repairs remain in install, upgrade, explicit enable, and Repair. Command installation now skips the PATH write and environment broadcast when the user PATH is already correct.
+- **Files:** `lanfile.ps1`, `UI.md`, `AGENT_CHANGELOG.md`
+- **Notes:** Auto chat remains enabled by default and still self-recovers if its background listener has stopped; normal startup no longer rewrites installation state.
 
-## 2026-09-30 - publish Slip 0.0.4
+## 2026-10-02 - Explorer Send to Slip
 
-- **Why:** chat should be one PC at a time, and Check and fix should set the network to Private
-- **Changes:** replaced `get` with version 0.0.4. Menus are sectioned. Upgrade is no longer its own Diagnostics item; Check and fix does the update.
-- **Files:** `get`, `AGENT_CHANGELOG.md`
-- **Notes:** Diagnostics → Check and fix downloads this file and may show one approval prompt for the firewall and Private network.
+- **Why:** Sending through Outbox and the full menu is too many steps for everyday one-PC-to-another transfers.
+- **Changes:** Version 0.0.8. Install/upgrade/Repair now create `%APPDATA%\Microsoft\Windows\SendTo\Slip.lnk`, targeting the installed host script's new `sendto` entry. Explorer-selected files and folders bypass Outbox and PIN, reuse Quick receive, automatically choose the only available receiver, and show a short picker when several receivers are available. Multiple items and folders reuse `New-SendPayload` and arrive as one zip. Remove deletes the shortcut. Status and remote diagnosis report whether the shortcut exists.
+- **Files:** `lanfile.ps1`, `UI.md`, `AGENT_CHANGELOG.md`
+- **Notes:** The receiving PC must have Quick receive on. A no-target or failed transfer stays visible with a plain explanation; success closes after two seconds. The shortcut launches PowerShell directly, so selected paths are passed by Explorer rather than expanded through a batch file.
 
-## 2026-09-30 - publish Slip 0.0.3
+## 2026-10-02 - scheduled update reminders
 
-- **Why:** a chat window that failed to connect back closed immediately, so the reason was unreadable
-- **Changes:** replaced `get` with version 0.0.3. A failed `chatjoin` stays open, names the address and port, and waits for Enter.
-- **Files:** `get`, `AGENT_CHANGELOG.md`
-- **Notes:** Diagnostics → Check and fix downloads this file. The PC that starts the chat must be on a Private network.
+- **Why:** The user wants Slip to check after a chosen time and inform them when a new build exists, without silently installing it.
+- **Changes:** Version 0.0.7. Added More -> Update reminders with Check now, a configurable daily `HH:mm` time, and Off. Enabling creates a limited current-user `Slip Update Reminder` scheduled task that runs the hidden `updatecheck` entry. Current/offline automatic checks stay silent; a newer version opens a normal `updatenotice` window once per version and points to Diagnostics -> Check and fix. State and the last-notified version live in `Documents\Slip\update-reminder.json`. Upgrade preserves and refreshes the task, Repair recreates it when missing, and Remove deletes it.
+- **Files:** `lanfile.ps1`, `UI.md`, `AGENT_CHANGELOG.md`
+- **Notes:** The reminder is notification-only and never installs an update. It uses an Interactive/Limited principal and StartWhenAvailable, so a missed time runs when that user is next available. Scheduled-task creation failure leaves reminders off instead of claiming they are active.
 
-## 2026-09-30 - publish Slip 0.0.2
+## 2026-10-02 - paired remote diagnosis
 
-- **Why:** chat messages after the first one waited until the other person pressed Enter
-- **Changes:** replaced `get` with version 0.0.2. Chat input uses `[Console]::KeyAvailable` and `[Console]::ReadKey` so the socket keeps being read while the window is idle.
-- **Files:** `get`, `AGENT_CHANGELOG.md`
-- **Notes:** Both PCs need 0.0.2. Diagnostics → Check and fix downloads this file. If a chat still stalls, `chat.session.input` in the debug log says which input mode that window used.
+- **Why:** The existing remote switch could only turn Quick receive and Auto chat on. It could not securely return enough state to diagnose another PC from here.
+- **Changes:** Version 0.0.6. Added opt-in Remote help with its own background listener and `SUPPORT` beacon. The target shows a 96-bit pairing code; both PCs keep derived keys under current-user DPAPI protection. Status requests use HMAC-SHA256, a two-minute timestamp window, and replay nonces. Reports use AES-256-CBC plus encrypt-then-MAC and include fixed read-only Slip, Windows, network, firewall, disk, listener, finding, and recent Slip-log fields. Added `remote-diagnose.ps1` to pair, request, print, and save reports. Remote help survives upgrade and Repair when enabled, stays off by default, and can be disabled or re-keyed from More.
+- **Files:** `lanfile.ps1`, `remote-diagnose.ps1`, `UI.md`, `AGENT_CHANGELOG.md`
+- **Notes:** This deliberately is not remote desktop or remote PowerShell and cannot execute caller-supplied commands. First use on the other PC: update to 0.0.6, More -> Remote help -> turn on, then enter its pairing code once on this PC. Resetting the code revokes existing pairings.
 
-## 2026-09-30 - publish Slip 0.0.1
+## 2026-10-01 - remote enable for Quick receive and Auto chat
 
-- **Why:** other PCs were still downloading 1.3.5, so they could not get the separate chat window
-- **Changes:** replaced `get` with version 0.0.1. This PC was installed from the local script with `SLIP_FETCHED_UPGRADE=1`.
-- **Files:** `get`, `AGENT_CHANGELOG.md`
-- **Notes:** Chat's separate Command Prompt window needs both PCs on 0.0.1. A PC still on 1.3.x gets there with `slip upgrade` once. After that, Diagnostics, Check and fix is the updater.
+- **Why:** A PC with Slip open could be seen from here, but nothing was listening that could turn Quick receive or Auto chat on
+- **Changes:** Version 0.0.5. While the Slip menu is open it listens on a Slip port and advertises that port in the OPEN beacon. `ENABLE quick` and `ENABLE chat` on that port turn the matching listener on. A PC that already has Quick receive accepts `ENABLE chat`. A PC that already has Auto chat accepts `ENABLE quick`. Added `enable-remote.ps1 -Name pink_juice` to send those from this PC.
+- **Files:** `lanfile.ps1`, `enable-remote.ps1`, `AGENT_CHANGELOG.md`
+- **Notes:** The copy already running on pink_juice is older, so its OPEN beacon still has port 0. That PC needs Check and fix once. After the menu shows 0.0.5, `enable-remote.ps1 -Name pink_juice` can turn both listeners on without anyone typing there. These commands only enable. They do not run files or other actions.
+
+## 2026-10-01 - open a remote chat test from this PC
+
+- **Why:** The user needs the other PC's chat window tested without anyone using that keyboard
+- **Changes:** Added `open-remote-chat.ps1`. It listens for Slip Auto chat beacons, and if none arrive it checks Slip ports on PCs already seen on the LAN. For each one it sends a chat invite and records whether the window connected back. Result is printed here and saved to `Documents\Slip\Debug\remote-chat-test.txt`. Stopped the earlier collector that waited for someone to run a script on the other PC.
+- **Files:** `open-remote-chat.ps1`, `AGENT_CHANGELOG.md`
+- **Notes:** Auto chat must already be running on the other PC. Pass `-Name pink_juice` to test one PC and skip the others. A window that accepts the invite but does not connect back means that PC could not reach this PC (network or firewall).
+
+## 2026-10-01 - chat open diagnose script
+
+- **Why:** One of the user's PCs is not opening the chat window. They need a test window on that PC and the findings back on this PC.
+- **Changes:** Added `diagnose-chat.ps1` (run on the problem PC) and `collect-chat-diagnose.ps1` (run on this PC). The diagnose script records version, Auto chat, listener, network, firewall, and recent chat log lines, opens a local Slip chat test window, and sends the report to TCP 8796. The collector writes `Documents\Slip\Debug\chat-diagnose-remote.txt`.
+- **Files:** `diagnose-chat.ps1`, `collect-chat-diagnose.ps1`, `AGENT_CHANGELOG.md`
+- **Notes:** Default report target is 192.168.152.132. Port 8796 is inside the existing Slip TCP private-network rule. The collector holds that port until one report arrives or 20 minutes pass. Do not publish these as `get`.
+
+## 2026-09-30 - Slip 0.0.4 installed here and published
+
+- **Why:** Other PCs need one-to-one chat, the sectioned menus, and Check and fix that also sets the network to Private
+- **Changes:** Installed the local 0.0.4 script with `SLIP_FETCHED_UPGRADE=1` and published it as `get` (was 0.0.3).
+- **Files:** `AGENT_CHANGELOG.md`, published `get`
+- **Notes:** Other PC: Diagnostics → Check and fix, then reopen Slip. The menu should show 0.0.4. Chat is one PC at a time. Check and fix can show one Windows approval prompt because it adds the firewall rules and sets the network to Private together.
+
+## 2026-09-30 - Slip 0.0.4 single-person chat, sectioned menus, stronger one-click
+
+- **Why:** The multi-select chat picker caused errors when sending to more than one PC; the user wants one-to-one click-to-connect chat and cleaner, sectioned menus, plus a network Private/Public toggle and a one-click diagnostic that also reinforces setup and makes the network Private.
+- **Changes:** Version 0.0.4.
+  - **Chat is one-to-one:** `Show-ChatPeople` rewritten to use `Read-ArrowMenu` (single select) - pick a PC, Enter/number opens the chat with just that PC. No checkboxes, no space-to-toggle, no multi-select. `Show-StartChat` still wraps the pick as a one-element list, so `chathost`/`Start-ChatWith` are unchanged.
+  - **Menu sections:** `Read-ArrowMenu` gained `-SeparatorsAfter <int[]>` that draws a `----` line after the given item indices (purely visual; numbering and return values unchanged). Main menu: `Send files, Receive files | Chat | More` (Folders removed from here). More menu: `Folders, How to send and receive, Check connection | Quick receive, Auto chat, Network | Diagnostics`. Diagnostics: `Check and fix, Status, Repair, Remove | Rename this PC, Open Debug folder, Chat log` - Upgrade removed (Check and fix updates), Network moved to More.
+  - **Network toggle:** new `Set-ActiveNetworksPublic`, `Show-NetworkToggle` (shows Private/Public and flips it, elevating when needed), and `netpublic` entry. More menu item shows the current type and toggles it.
+  - **One-click reinforced:** `Repair-SlipStartupEntries` now runs `Ensure-SlipFiles` (recreate folders, refresh profile + command) like Repair. `Invoke-SlipSelfHeal` now actually makes the network Private (was report-only) and combines firewall + network admin work into a single `fixnet` elevated pass, so the user sees one UAC prompt instead of two. New `fixnet` entry = `Install-FirewallRules` + `Set-ActiveNetworksPrivate`.
+- **Files:** `lanfile.ps1`, `UI.md`, `NETWORKING_WSL.md`, `AGENT_CHANGELOG.md`
+- **Notes:** Republish `get` as 0.0.4. Parser clean; separator render verified. Group-Policy-locked machines may still refuse the network/firewall change; the report shows Firewall FAILED / Network `Still Public` in that case.
+
+## 2026-09-30 - Slip 0.0.3 installed here and published
+
+- **Why:** The other PCs need the chat window that stays open and explains a failed connect-back
+- **Changes:** Installed the local 0.0.3 script with `SLIP_FETCHED_UPGRADE=1` and published it as `get` (was 0.0.2).
+- **Files:** `AGENT_CHANGELOG.md`, published `get`
+- **Notes:** Other PC: Diagnostics → Check and fix, then reopen Slip. The menu should show 0.0.3. A guest window that cannot connect back stays open and names the address and port. The PC that starts the chat still has to be on a Private network.
+
+## 2026-09-30 - Slip 0.0.3 chatjoin shows why it could not connect back
+
+- **Why:** A report that the "geforce" laptop (192.168.152.81) could not send or receive chats and "some kind of elevated protection" was suspected. Diagnosed live from the Vengeance PC (192.168.152.132, same /24): geforce's Auto chat listener was up and advertising CHAT on 8787 (QUICK on 8788), 8787 was reachable, a test INVITE returned OK, and a full end-to-end test (real host listener on 8790 + INVITE) had geforce's guest window spawn, connect back out, and send `HELLO` correctly. So geforce is not blocked - the chat mechanism works with it. The "window pops up and vanishes" is the guest failing to connect back to the PC that started the chat (that PC on a Public network or its chat port firewalled), and `chatjoin`'s catch just printed "chat closed" and exited, so the window flashed shut with no readable reason.
+- **Changes:** Version 0.0.3. The `chatjoin` entry's failure path now clears the screen and shows a plain explanation - which PC/address:port it tried to connect back to, that the other PC likely is Public or firewalled, the fix (Check and fix + set Private on that PC), the exception detail - and waits on `Press Enter to close` instead of vanishing. The connect timeout now throws a specific `timed out connecting to <addr>:<port>` message. No protocol change.
+- **Files:** `lanfile.ps1`, `UI.md`, `NETWORKING_WSL.md`, `AGENT_CHANGELOG.md`
+- **Notes:** Root cause of the original report is environmental: the initiating/other PC (likely Pink Juice, and earlier Vengeance) on a Public network, not geforce and not endpoint security. Diagnostic method worth reusing: from a peer, listen on UDP 47654 for beacons to confirm a PC's listener/port, TCP-probe its 8787-8796, then send a crafted `INVITE|room|hostPort|fromB64|bodyB64` and watch for `OK` and a connect-back to hostPort. Republish `get` as 0.0.3 (optional; this is a diagnostics/UX change, no wire change).
+
+## 2026-09-30 - Slip 0.0.2 installed here and published
+
+- **Why:** Both PCs have to be on 0.0.2 before the chat input fix can be tested
+- **Changes:** Installed the local 0.0.2 script with `SLIP_FETCHED_UPGRADE=1` and published it as `get` (was 0.0.1).
+- **Files:** `AGENT_CHANGELOG.md`, published `get`
+- **Notes:** Other PC: Diagnostics → Check and fix, then reopen Slip. Test by sending several messages from one side while the other does not press a key. If messages still wait for Enter, read `chat.session.input` in that PC's `Documents\Slip\Debug\transfer-debug.log`. `mode=console-keys` is the new path. `mode=read-host` means the window had no live keyboard and used line input instead. Do not send chat key checks back through `$Host.UI.RawUI.KeyAvailable`.
+
+## 2026-09-30 - Slip 0.0.2 fix chat receive stalling until a key is pressed
+
+- **Why:** In a live chat, the receiver only saw the second and later messages after pressing Enter (or any key). The opening message showed fine because it is printed before the loop starts. Root cause: the chat input loop gated its key read with `$Host.UI.RawUI.KeyAvailable`, which under Windows Terminal / ConPTY (the Windows 11 default) can report a key available when there is none; `Read-SlipKey` (`$Host.UI.RawUI.ReadKey`) then blocked waiting for a real key, so the socket was not polled and incoming messages queued until the user pressed something.
+- **Changes:** Version 0.0.2. Added `Test-ChatConsoleKeys` (probes `[Console]::KeyAvailable`) and `Read-ChatKey` (`[Console]::ReadKey($true)`, mapped to the same `@{ Name; Char }` shape). `Show-ChatSession` now decides raw vs fallback with `Test-ChatConsoleKeys`, gates input with `[Console]::KeyAvailable` (reliable and non-blocking under conhost and ConPTY), and reads keys with `Read-ChatKey` in both the main loop and the Esc leave-confirm. Idle poll is 10 ms. Logs the chosen input mode to transfer-debug as `chat.session.input`. The menu key helpers (`Read-SlipKey`, `Read-ArrowMenu`, `Read-PickerAction`) are unchanged - they only wait for input and have no async receive to starve.
+- **Files:** `lanfile.ps1`, `UI.md`, `NETWORKING_WSL.md`, `AGENT_CHANGELOG.md`
+- **Notes:** Republish `get` as 0.0.2; both PCs need it. No wire-protocol change. If a report still shows the stall, check the `chat.session.input` line in `Documents\Slip\Debug\transfer-debug.log`: `mode=read-host` means the window fell back to blocking line input (input redirected / not a real console), a different path. Do not route the chat's live input back through `$Host.UI.RawUI.KeyAvailable`.
+
+## 2026-09-30 - Slip 0.0.1 is installed here and published
+
+- **Why:** Go live so this PC and the other PCs run the same chat-window build
+- **Changes:** Ran `lanfile.ps1 upgrade` with `SLIP_FETCHED_UPGRADE=1`, then cleared that variable. Installed host is `AppData\Local\Slip\slip-host.ps1` version 0.0.1. Published that file as `get` (was 1.3.5).
+- **Files:** `AGENT_CHANGELOG.md`, published `get`
+- **Notes:** Auto chat is on. Quick receive was already on and stayed on. The active network `Subzerolounge 3` is Public, so other PCs cannot connect until Diagnostics → Network makes it Private. Other PCs that are still on 1.3.x should run `slip upgrade` once; Check and fix exists only after they are on 0.0.1. Both PCs must be on 0.0.1 for chat to open in its own window.
+
+## 2026-09-30 - Slip 0.0.1 one-click self-heal, chat in its own cmd window, version reset
+
+- **Why:** Consolidate the scattered diagnostic actions into one "check and fix everything" flow with a report, and stop the chat from taking over / opening in the PowerShell window. Version scheme reset to 0.0.x per request.
+- **Changes:** Version reset **1.3.7 -> 0.0.1** (`lanfile.ps1`, all `UI.md`/`NETWORKING_WSL.md` version strings).
+  - **One-click self-heal:** New Diagnostics item **1 "Check and fix (one click)"** (`Show-SelfHealScreen` + `Invoke-SlipSelfHeal`). Runs in order, printing each step live so the window never looks frozen: (1) `Get-OnlineSlipVersion` downloads `get`, compares to `$script:Version`; if different, runs the fetched payload with `SLIP_FETCHED_UPGRADE=1 upgrade -Quiet`; (2) `Set-SlipScriptPolicy -Quiet` enables local scripts; (3) `Repair-SlipStartupEntries` re-adds the `slip` command + PATH (`Install-SlipCommand`) and the HKCU Run keys for Auto chat / Quick receive when missing or wrong; (4) firewall rules via `Install-FirewallRules`, elevating through `Invoke-ElevatedEntry -Entry 'firewall'` (UAC) when not admin; (5) network type reported (not forced). Ends with a per-check report (OK / FIXED / CHECK / FAILED) and an overall verdict. The standalone "Fix script policy" Diagnostics item from the previous build was removed (subsumed); `Set-SlipScriptPolicy` stays as the worker.
+  - **Chat in its own cmd window:** New `Start-ChatConsole` opens a normal Command Prompt window (`%ComSpec% /c title ... & powershell -File ... <entry>`) that hosts the chat, with the title stripped to `[\w \-]` so a peer name cannot inject a command (entry args are base64 + IP/port/room only). `Start-ChatPopup` (incoming invite) now uses it. Hosting a chat no longer runs inline in the Slip window: `Show-StartChat` encodes the picked peers (`ConvertTo-Json` -> base64 `-PeopleB64`) and the message (`-OpeningB64`) and launches a new `chathost` entry, which decodes and calls `Start-ChatWith`, then pauses on `Press Enter to close`. Added the `chathost` token, the `-PeopleB64` option, and its dispatch. The hidden `chatlisten` background listener stays PowerShell (no window).
+- **Files:** `lanfile.ps1`, `UI.md`, `NETWORKING_WSL.md`, `AGENT_CHANGELOG.md`
+- **Notes:** Republish `get` as 0.0.1. Verified: parser clean; people JSON base64 round-trips (single element preserved via `@()`); the cmd launch passes a spaced `-File` path + base64 args through to the entry parser correctly (tested with `Start-Process %ComSpec% -ArgumentList $full`). The self-heal update step reinstalls in a child process, so the running window keeps the old code until Slip is reopened - the report says so. No wire-protocol change; 0.0.1 chats with older builds. Firewall/update steps can raise UAC by design ("prompt the admin").
+
+## 2026-09-30 - Slip 1.3.7 chat disconnect notices, clean exit, send back nav, script policy fix
+
+- **Why:** Four reported issues. A PC that closed its window or pressed Ctrl+C left the other side hanging with no notice. There was no obvious, safe way to leave a chat. Backing out of the "Choose a PC" send screen dropped all the way to the main menu, losing the file selection. And one PC showed a red "running scripts is disabled" message at every PowerShell start.
+- **Changes:** Version 1.3.7.
+  - **Disconnect detection (issue 1):** Added `Test-SocketDead` (uses `Socket.Poll` + `Available` to spot a closed/reset TCP connection). `Show-ChatSession` now polls each member (host) and the host link (guest) every loop, so an abrupt close/Ctrl+C/network drop surfaces promptly as `left` (host broadcasts `SYS|left` to the rest) or `<host> left. Chat closed.` (guest). Graceful `BYE`/`SYS|closed` paths are unchanged. `Show-ChatSession` gained a `-Client` param; the `chatjoin` guest call now passes its `TcpClient` so the guest can detect a dead host link.
+  - **Clean exit with confirm (issue 2):** Esc now leaves the chat. If the other PC is still connected it asks `[Y] Leave [N] Stay`; if the other PC has already gone, one Esc exits immediately. A guest window pauses on `Press Enter to close` at the end so the closing notice is readable before the popup disappears.
+  - **Send back-navigation (issue 4):** `Show-SendFiles` wraps file selection and PC choice in one step loop. Backing out of the PC search (`0`, or `Q`/`else` on the no-PC-found fallback, or cancelling manual IP entry) now `continue`s back to the file list with the same items still checked, instead of returning to the main menu. `Q` on the file list itself still returns to the main menu, and a completed/failed send still ends the screen.
+  - **Script policy fixer (issue 3), added on explicit user request:** New `Set-SlipScriptPolicy` and Diagnostics item **9 "Fix script policy"** (`Show-ScriptPolicyScreen`). It is user-initiated only (not run automatically on install), shows the account's current `Get-ExecutionPolicy -Scope CurrentUser`, asks `[Y] Fix now [N] Back`, then sets `CurrentUser` (and `LocalMachine` when already elevated) to `RemoteSigned` and unblocks Slip's installed script and profile files. Group-Policy-forced (`MachinePolicy`/`UserPolicy`) settings are reported as un-fixable. This addresses the red "running scripts is disabled on this system" message that appears when a PowerShell window opens on a PC left at `Restricted`.
+- **Files:** `lanfile.ps1`, `UI.md`, `NETWORKING_WSL.md`, `AGENT_CHANGELOG.md`
+- **Notes:** Republish `get` for 1.3.7. No wire-protocol change, so 1.3.7 chats with older builds. The script-policy fixer changes a Windows security setting, so it is deliberately behind a manual Diagnostics action with a confirmation prompt rather than run during install — keep it that way; do not auto-run execution-policy changes without a prompt.
+
+## 2026-09-30 - Slip 1.3.6 instant chat typing, no double line
+
+- **Why:** In a chat window each message showed twice — the live `> hi` draft line stayed on screen and then `vengeance: hi` printed under it — and typing felt laggy.
+- **Changes:** Version 1.3.6. `Show-ChatSession` now evaluates the console input mode once (`$rawInput`) instead of calling `Test-SlipConsoleKeys` every loop. Added `Clear-ChatInput`/`Show-ChatInput`/`Write-ChatLine` helpers: the `> draft` line is drawn once at session start and fully cleared and redrawn on each keystroke, so backspacing over several characters no longer leaves artifacts. On Enter the draft line is cleared and replaced by a single `You: <text>` line (was a leftover `> text` line plus a separate `name: text` echo). Incoming messages and room notices (`joined`/`left`/`chat closed`) print through `Write-ChatLine`, which clears the input line, prints, then redraws the preserved draft, so an arriving message never collides with what you are typing. The `Read-Host` fallback path no longer re-echoes the sent text (the console already showed it), removing the duplicate there too. Idle poll sleep lowered from 15 ms to 8 ms for snappier incoming display.
+- **Files:** `lanfile.ps1`, `UI.md`, `NETWORKING_WSL.md`, `AGENT_CHANGELOG.md`
+- **Notes:** Republish `get` so other PCs pick up 1.3.6. The UI.md chat example already documented the single `You:` line; the code now matches it. No wire-protocol change, so a 1.3.6 window still talks to older builds. Only the raw-key console path (the normal popup) gets the live single-line prompt; the redirected-input fallback still uses `Read-Host`.
+
+## 2026-09-30 - Teensy online bootstrap uses fetched Slip directly
+
+- **Why:** The board should upgrade old laptops without depending on whatever stale local `slip` command is already installed there.
+- **Changes:** Refreshed `teensy-slip-installer` and `teensy-slip-installer-source-debug` encoded payloads. The board opens PowerShell, downloads `https://everlasting-dev.github.io/get` to `%TEMP%\slip-upgrade.ps1`, validates that it is the Slip installer, sets `SLIP_FETCHED_UPGRADE=1`, and runs the fetched file with `upgrade -QuickReceive -Quiet`. The payload writes `Documents\Slip\Debug\teensy-upgrade-log.txt` with the downloaded version, byte count, installer exit code, and failures.
+- **Files:** `teensy-slip-installer/teensy-slip-installer.ino`, `teensy-slip-installer-source-debug/teensy-slip-installer-source-debug.ino`, `AGENT_CHANGELOG.md`
+- **Notes:** The regular sketch auto-starts after 6 seconds with `REQUIRE_ARM_PIN=false`. Set it to `true` if you want physical arming on pin 2 before it types. Windows may still show an approval prompt for firewall/UAC; the Teensy payload handles the typing, not secure-desktop approvals.
 
 ## 2026-09-30 - Slip 1.3.5 visible online upgrade check
 
