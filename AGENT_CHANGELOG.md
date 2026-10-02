@@ -3,6 +3,13 @@
 Internal handoff log for Cursor agents and plugins. Newest entries first.
 Read before editing; append after substantive changes.
 
+## 2026-10-02 - reopen the menu after Diagnostics updates
+
+- **Why:** Check and fix installed the downloaded version correctly, but then returned to the already-running menu process, whose in-memory version and code remained old until the user closed and reopened Slip.
+- **Changes:** Version 0.0.10. A fetched upgrade now detects when its direct parent is the installed Slip menu. After installation it starts a hidden replacement helper from the newly installed script; the helper waits for the updater to finish, closes only that verified old menu process, and opens a fresh normal Slip menu. Direct command-line and unattended upgrades do not match the menu-parent check and keep their existing behavior.
+- **Files:** `lanfile.ps1`, `UI.md`, `AGENT_CHANGELOG.md`
+- **Notes:** This works during the update from 0.0.9 because detection and replacement run inside the newly downloaded child script, not the old menu code.
+
 ## 2026-10-02 - faster normal startup
 
 - **Why:** Opening `slip` was delayed because Auto chat ran the full command installation path before drawing every menu, including script hashing, launcher and shortcut rewrites, user PATH work, and a Windows environment broadcast that could wait up to five seconds.

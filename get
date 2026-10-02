@@ -12,7 +12,7 @@ $script:RawArgs = @($args)
 $script:RuleTcp = "$($script:AppName) TCP"
 $script:RuleUdp = "$($script:AppName) Discovery"
 $script:BeaconPrefix = $script:AppName.ToUpperInvariant() + '1'
-$script:Version = '0.0.9'
+$script:Version = '0.0.10'
 
 function Initialize-SlipSecurityProtocol {
     try {
@@ -894,8 +894,53 @@ function Invoke-UnattendedInstall {
     return $false
 }
 
+function Get-SlipMenuParentProcessId {
+    try {
+        $current = Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $PID) -ErrorAction Stop
+        $parentProcessId = [int]$current.ParentProcessId
+        if ($parentProcessId -le 0) { return 0 }
+        $parent = Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $parentProcessId) -ErrorAction Stop
+        $commandLine = [string]$parent.CommandLine
+        $installedPath = [IO.Path]::GetFullPath((Get-InstalledScriptPath))
+        $menuPattern = '(?i)-File\s+"?{0}"?\s+menu(?:\s|$)' -f [regex]::Escape($installedPath)
+        if ([string]$parent.Name -notmatch '(?i)^powershell(\.exe)?$') { return 0 }
+        if ($commandLine -notmatch $menuPattern) { return 0 }
+        return $parentProcessId
+    } catch {
+        return 0
+    }
+}
+
+function Start-SlipMenuReplacement {
+    param([int]$ParentProcessId, [int]$WaitProcessId)
+    if ($ParentProcessId -le 0 -or $WaitProcessId -le 0) { return $false }
+    $scriptPath = Get-InstalledScriptPath
+    if (-not (Test-Path -LiteralPath $scriptPath)) { return $false }
+    $arguments = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" restartmenu -ParentProcessId {1} -WaitProcessId {2}' -f $scriptPath, $ParentProcessId, $WaitProcessId
+    Start-Process -FilePath powershell.exe -ArgumentList $arguments -WindowStyle Hidden | Out-Null
+    return $true
+}
+
+function Invoke-SlipMenuReplacement {
+    param([int]$ParentProcessId, [int]$WaitProcessId)
+    if ($WaitProcessId -gt 0 -and $WaitProcessId -ne $PID) {
+        Wait-Process -Id $WaitProcessId -Timeout 60 -ErrorAction SilentlyContinue
+    }
+    Start-Sleep -Milliseconds 250
+    if ($ParentProcessId -gt 0 -and $ParentProcessId -ne $PID) {
+        Stop-Process -Id $ParentProcessId -Force -ErrorAction SilentlyContinue
+        Wait-Process -Id $ParentProcessId -Timeout 5 -ErrorAction SilentlyContinue
+    }
+    $scriptPath = Get-InstalledScriptPath
+    if (-not (Test-Path -LiteralPath $scriptPath)) { return $false }
+    $arguments = '-NoProfile -ExecutionPolicy Bypass -File "{0}" menu' -f $scriptPath
+    Start-Process -FilePath powershell.exe -ArgumentList $arguments -WindowStyle Normal | Out-Null
+    return $true
+}
+
 function Invoke-UnattendedUpgrade {
     param([string]$DisplayName, [switch]$QuickReceive, [switch]$Quiet, [switch]$MakeNetworkPrivate)
+    $menuParentProcessId = Get-SlipMenuParentProcessId
     $name = $null
     if (-not [string]::IsNullOrWhiteSpace($DisplayName)) {
         $name = ConvertTo-CleanDisplayName -Name $DisplayName -Fallback $env:COMPUTERNAME
@@ -920,6 +965,11 @@ function Invoke-UnattendedUpgrade {
     if ($remoteHelpShouldRun) { Enable-RemoteHelp -Quiet }
     if ((Get-UpdateReminderState).Enabled) { [void](Register-UpdateReminderTask) }
     Write-SlipLog "Upgrade completed. version=$($script:Version) setupOk=$([bool]$ok) quickReceive=$([bool]$quickShouldRun) autoChat=true remoteHelp=$([bool]$remoteHelpShouldRun)."
+    if ($menuParentProcessId -gt 0) {
+        if (Start-SlipMenuReplacement -ParentProcessId $menuParentProcessId -WaitProcessId $PID) {
+            Write-SlipLog "Upgrade scheduled menu replacement. parentPid=$menuParentProcessId helperWaitPid=$PID."
+        }
+    }
     if (-not $Quiet) {
         Write-Host "$($script:AppName) $($script:Version) is installed." -ForegroundColor Green
         Write-Host ("Shown as: {0}" -f (Get-DisplayName))
@@ -4699,6 +4749,8 @@ function Get-EntryOptions {
         OpeningB64 = $null
         PeopleB64 = $null
         OnlineVersion = $null
+        ParentProcessId = 0
+        WaitProcessId = 0
         Paths = @()
     }
     if ($env:SLIP_ENTRY) { $o.Entry = $env:SLIP_ENTRY }
@@ -4721,6 +4773,7 @@ function Get-EntryOptions {
         elseif ($token -eq 'remotehelp') { $o.Entry = 'remotehelp' }
         elseif ($token -eq 'updatecheck') { $o.Entry = 'updatecheck' }
         elseif ($token -eq 'updatenotice') { $o.Entry = 'updatenotice' }
+        elseif ($token -eq 'restartmenu') { $o.Entry = 'restartmenu' }
         elseif ($token -eq 'enablechat') { $o.Entry = 'enablechat' }
         elseif ($token -eq 'enablequick') { $o.Entry = 'enablequick' }
         elseif ($token -eq 'chatjoin') { $o.Entry = 'chatjoin' }
@@ -4742,6 +4795,8 @@ function Get-EntryOptions {
         elseif ($token -eq '-OpeningB64' -and ($i + 1) -lt $pending.Count) { $i++; $o.OpeningB64 = [string]$pending[$i] }
         elseif ($token -eq '-PeopleB64' -and ($i + 1) -lt $pending.Count) { $i++; $o.PeopleB64 = [string]$pending[$i] }
         elseif ($token -eq '-OnlineVersion' -and ($i + 1) -lt $pending.Count) { $i++; $o.OnlineVersion = [string]$pending[$i] }
+        elseif ($token -eq '-ParentProcessId' -and ($i + 1) -lt $pending.Count) { $i++; $o.ParentProcessId = [int]$pending[$i] }
+        elseif ($token -eq '-WaitProcessId' -and ($i + 1) -lt $pending.Count) { $i++; $o.WaitProcessId = [int]$pending[$i] }
         elseif ($token -like '-*') { }
         else { $paths += $token }
         $i++
@@ -4757,6 +4812,15 @@ function Exit-Slip {
 
 $script:Opt = Get-EntryOptions
 switch ($script:Opt.Entry) {
+    'restartmenu' {
+        try {
+            if (Invoke-SlipMenuReplacement -ParentProcessId $script:Opt.ParentProcessId -WaitProcessId $script:Opt.WaitProcessId) { Exit-Slip 0 }
+            else { Exit-Slip 1 }
+        } catch {
+            Write-SlipLog "Menu replacement failed: $($_.Exception.Message)"
+            Exit-Slip 1
+        }
+    }
     'install' {
         try {
             if (Invoke-UnattendedInstall -DisplayName $script:Opt.DisplayName -QuickReceive:$script:Opt.QuickReceive -Quiet:$script:Opt.Quiet -MakeNetworkPrivate:$script:Opt.MakeNetworkPrivate) {
