@@ -12,7 +12,7 @@ $script:RawArgs = @($args)
 $script:RuleTcp = "$($script:AppName) TCP"
 $script:RuleUdp = "$($script:AppName) Discovery"
 $script:BeaconPrefix = $script:AppName.ToUpperInvariant() + '1'
-$script:Version = '0.0.10'
+$script:Version = '0.0.11'
 
 function Initialize-SlipSecurityProtocol {
     try {
@@ -1911,7 +1911,10 @@ function Show-SendFiles {
             $how = Read-ArrowMenu -Title 'Choose a PC' -Lines @(
                 ("This send is {0}." -f (Format-ByteSize $sendTotal)),
                 'Pick the PC that should receive these files.'
-            ) -Items $labels -ZeroLabel 'Back' -Hint 'Arrow keys move. Enter chooses. Type the number to choose that PC. 0 goes back.'
+            ) -Items $labels -Descriptions (@($quick | ForEach-Object { 'Send straight to this PC. It has Quick receive on, so nobody needs to type anything.' }) + @(
+                'Type the IP address of a PC that has Quick receive on.',
+                'Make a PIN here. The other PC types it in Receive files to download.'
+            )) -ZeroLabel 'Back' -Hint 'Arrow keys move. Enter chooses. Type the number to choose that PC. 0 goes back.'
             if ($how -lt 0) { continue }
             if ($how -lt $quick.Count) {
                 $usePin = $false
@@ -2017,7 +2020,7 @@ function Show-SendToSlip {
         $pick = Read-ArrowMenu -Title 'Send with Slip' -Lines @(
             ("{0} item(s), {1}" -f $items.Count, (Format-ByteSize $total)),
             'Pick the PC that should receive them.'
-        ) -Items $labels -ZeroLabel 'Cancel'
+        ) -Items $labels -Descriptions @($targets | ForEach-Object { 'Send the selected files to this PC now.' }) -ZeroLabel 'Cancel'
         if ($pick -lt 0) { return $false }
         $target = $targets[$pick]
     }
@@ -2176,7 +2179,8 @@ function Read-ArrowMenu {
         [string[]]$Lines = @(),
         [string]$ZeroLabel = 'Back',
         [string]$Hint = 'Arrow keys move. Enter chooses. Type the number to choose that line. 0 goes back.',
-        [int[]]$SeparatorsAfter = @()
+        [int[]]$SeparatorsAfter = @(),
+        [string[]]$Descriptions = @()
     )
     $index = 0
     $interactive = Test-SlipConsoleKeys
@@ -2194,8 +2198,13 @@ function Read-ArrowMenu {
         if ($Lines.Count -gt 0) { Write-Host '' }
         for ($i = 0; $i -lt $Items.Count; $i++) {
             $row = "[{0}] {1}" -f ($i + 1), $Items[$i]
+            $desc = if ($i -lt $Descriptions.Count) { [string]$Descriptions[$i] } else { '' }
             if ($i -eq $index -and $interactive) {
                 Write-Host ("  > " + $row) -ForegroundColor Green
+            }
+            elseif (-not $interactive -and $desc) {
+                Write-Host ("    " + $row) -NoNewline
+                Write-Host ("  - " + $desc) -ForegroundColor DarkGray
             }
             else {
                 Write-Host ("    " + $row)
@@ -2207,6 +2216,10 @@ function Read-ArrowMenu {
         Write-Host ''
         if ($ZeroLabel) { Write-Host ("    [0] {0}" -f $ZeroLabel) }
         Write-Host ''
+        if ($interactive -and $index -lt $Descriptions.Count -and $Descriptions[$index]) {
+            Write-Host ("  " + [string]$Descriptions[$index]) -ForegroundColor Cyan
+            Write-Host ''
+        }
         Write-Host $Hint -ForegroundColor DarkGray
         if (-not $interactive) {
             $typed = Read-Host 'Type a number'
@@ -2984,7 +2997,7 @@ function Show-ReceiveFiles {
         $labels = @($shares | ForEach-Object {
             "{0} ({1})  {2}  {3}" -f $_.Display, $_.Windows, $_.File, (Format-ByteSize $_.Size)
         })
-        $pick = Read-ArrowMenu -Title 'Receive files' -Lines @('Pick a PC that is sending.') -Items $labels -ZeroLabel 'Back'
+        $pick = Read-ArrowMenu -Title 'Receive files' -Lines @('Pick a PC that is sending.') -Items $labels -Descriptions @($shares | ForEach-Object { 'Download what this PC is sending into your Inbox.' }) -ZeroLabel 'Back'
         if ($pick -lt 0) { return }
         $chosen = $shares[$pick]
     }
@@ -3926,7 +3939,7 @@ function Show-ChatSession {
 function Show-ChatPeople {
     param($People)
     $items = @($People | ForEach-Object { "{0} ({1})" -f $_.Display, $_.Windows })
-    $pick = Read-ArrowMenu -Title 'Chat' -Lines @('Pick the PC you want to chat with.') -Items $items -ZeroLabel 'Back' -Hint 'Arrow keys move. Enter opens the chat with that PC. Type its number. 0 goes back.'
+    $pick = Read-ArrowMenu -Title 'Chat' -Lines @('Pick the PC you want to chat with.') -Items $items -Descriptions @($People | ForEach-Object { 'Open a chat window with this PC.' }) -ZeroLabel 'Back' -Hint 'Arrow keys move. Enter opens the chat with that PC. Type its number. 0 goes back.'
     if ($pick -lt 0) { return $null }
     return @($People[$pick])
 }
@@ -4026,6 +4039,9 @@ function Show-FoldersMenu {
         $pick = Read-ArrowMenu -Title 'Folders' -Lines @('Outbox is what you send. Inbox is what you receive.') -Items @(
             'Open Outbox',
             'Open Inbox'
+        ) -Descriptions @(
+            'Put files here; Send files sends everything in this folder.',
+            'Everything you receive lands here.'
         ) -ZeroLabel 'Back'
         switch ($pick) {
             0 { Open-Folder (Get-OutboxPath) }
@@ -4225,11 +4241,16 @@ function Show-UpdateReminderScreen {
         $state = Get-UpdateReminderState
         $status = if ($state.Enabled) { "Daily at $($state.Time)" } else { 'Off' }
         $items = if ($state.Enabled) { @('Check now', 'Change daily time', 'Turn reminders off') } else { @('Check now', 'Turn on daily reminders') }
+        $descs = if ($state.Enabled) {
+            @('Look online for a newer Slip right now.', 'Pick the time of day the quiet check runs.', 'Stop the daily update check.')
+        } else {
+            @('Look online for a newer Slip right now.', 'Check once a day and tell you when a new version exists. Nothing installs by itself.')
+        }
         $pick = Read-ArrowMenu -Title 'Update reminders' -Lines @(
             ("Status: {0}" -f $status),
             'Checks quietly and only alerts once for each new version.',
             'Updates are never installed automatically.'
-        ) -Items $items -ZeroLabel 'Back'
+        ) -Items $items -Descriptions $descs -ZeroLabel 'Back'
         if ($pick -lt 0) { return }
         if ($pick -eq 0) {
             Clear-Host
@@ -4539,6 +4560,14 @@ function Show-DiagnosticsMenu {
             'Rename this PC',
             'Open Debug folder',
             'Chat log'
+        ) -Descriptions @(
+            'Update Slip, set the network to Private and fix the firewall in one go.',
+            'Show what is installed, running and listening on this PC.',
+            'Reinstall Slip on this PC and rebuild its shortcuts and launchers.',
+            'Uninstall Slip from this PC. Your Inbox and Outbox stay.',
+            'Change the name other PCs see for this PC.',
+            'Open the folder with Slip''s debug logs (send these when something fails).',
+            'Read the saved chat history.'
         ) -SeparatorsAfter @(3) -ZeroLabel 'Back'
         switch ($pick) {
             0 { Show-SelfHealScreen }
@@ -4573,6 +4602,16 @@ function Show-MoreMenu {
             $netLabel,
             $remoteLabel,
             'Diagnostics'
+        ) -Descriptions @(
+            'Open the Outbox (what you send) or the Inbox (what you receive).',
+            'A short how-to for sending and receiving between PCs.',
+            'Test whether another PC can be reached from this one.',
+            'Turn the daily update check on or off, or check now.',
+            'When on, other PCs can send to this PC without a PIN.',
+            'When on, chats from other PCs open here by themselves.',
+            'Private lets PCs on this network find each other. Public hides this PC.',
+            'Let the developer check this PC''s Slip status remotely.',
+            'Check and fix, status, repair, remove, rename and logs.'
         ) -SeparatorsAfter @(3, 7) -ZeroLabel 'Back'
         switch ($pick) {
             0 { Show-FoldersMenu }
@@ -4611,6 +4650,11 @@ function Show-SlipMenu {
                 'Receive files',
                 'Chat',
                 'More'
+            ) -Descriptions @(
+                'Send what is in your Outbox to another PC on this network.',
+                'Download files another PC is sending to you.',
+                'Chat with another PC that has Slip.',
+                'Folders, switches, help and diagnostics.'
             ) -SeparatorsAfter @(1, 2) -ZeroLabel $zero
             switch ($pick) {
                 0 { Show-SendFiles }
@@ -4639,7 +4683,8 @@ function Uninstall-PreviousOctane {
         foreach ($key in $keys) {
             try { $prop = Get-ItemProperty $key.PSPath -ErrorAction Stop } catch { continue }
             if (-not $prop.DisplayName) { continue }
-            if ($names -notcontains $prop.DisplayName) { continue }
+            # matches 'Octane', 'Octane 0.9.6', 'Runscope 1.3.0', ...
+            if ([string]$prop.DisplayName -notmatch '^(Octane|Runscope)( \d[\w.\-]*)?$') { continue }
             $cmd = $prop.QuietUninstallString
             if (-not $cmd) { $cmd = $prop.UninstallString }
             if (-not $cmd) { continue }
@@ -4707,21 +4752,549 @@ function Invoke-GetOctane {
     Wait-Enter
 }
 
+# ---------------------------------------------------------------------------
+# Octane tools (install / repair / license / template pack)
+# ---------------------------------------------------------------------------
+$script:OctaneRepo = 'Everlasting-dev/octane'
+$script:OctaneSupabaseUrl = 'https://hgwmdowavadfbctlypin.supabase.co'
+$script:OctaneAnonKey = 'sb_publishable_wRhD8AZtNhOAXSv3k_f7Cg_5rzE11zp'
+$script:OctaneSession = $null
+$script:OctaneMachineSalt = 'octane-license-v1'
+$script:OctaneAnchorKey = 'HKLM:\SOFTWARE\EverlastingDev\Octane'
+
+function Get-OctaneTemplatesPath { Join-Path $env:APPDATA 'Octane\templates\templates.json' }
+
+function Get-OctaneInstall {
+    $roots = @(
+        'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
+        'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
+        'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+    )
+    foreach ($root in $roots) {
+        if (-not (Test-Path $root)) { continue }
+        foreach ($key in @(Get-ChildItem $root -ErrorAction SilentlyContinue)) {
+            $p = Get-ItemProperty $key.PSPath -ErrorAction SilentlyContinue
+            # electron-builder names the entry 'Octane 0.9.6' (name + version)
+            if (-not $p -or [string]$p.DisplayName -notmatch '^Octane( \d[\w.\-]*)?$') { continue }
+            $dir = $p.InstallLocation
+            if (-not $dir -and $p.DisplayIcon) { $dir = Split-Path ($p.DisplayIcon -replace '"', '' -replace ',\d+$', '') -Parent }
+            if (-not $dir) { $dir = Join-Path $env:LOCALAPPDATA 'Programs\Octane' }
+            return [pscustomobject]@{ Version = [string]$p.DisplayVersion; Dir = $dir; Key = $key.PSPath }
+        }
+    }
+    return $null
+}
+
+function Get-OctaneLatestRelease {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    try {
+        $r = Invoke-RestMethod -Headers @{ 'User-Agent' = 'octane-cli' } -Uri "https://api.github.com/repos/$($script:OctaneRepo)/releases/latest" -TimeoutSec 15
+        return [pscustomobject]@{ Version = ([string]$r.tag_name).TrimStart('v'); Release = $r }
+    } catch { return $null }
+}
+
+function Get-OctaneMachineId {
+    $guid = $null
+    try { $guid = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Cryptography' -Name MachineGuid -ErrorAction Stop).MachineGuid } catch { $guid = $env:COMPUTERNAME }
+    $bytes = [Text.Encoding]::UTF8.GetBytes(("{0}:{1}" -f $script:OctaneMachineSalt, ([string]$guid).ToLowerInvariant()))
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { return (($sha.ComputeHash($bytes) | ForEach-Object { $_.ToString('x2') }) -join '') } finally { $sha.Dispose() }
+}
+
+function Get-OctaneApiError {
+    param($ErrorRecord)
+    $msg = $ErrorRecord.Exception.Message
+    try {
+        $body = $ErrorRecord.ErrorDetails.Message
+        if ($body) {
+            $j = $body | ConvertFrom-Json
+            if ($j.error_description) { return $j.error_description }
+            if ($j.msg) { return $j.msg }
+            if ($j.message) { return $j.message }
+        }
+    } catch { }
+    return $msg
+}
+
+function Connect-OctaneAccount {
+    param([switch]$Owner)
+    if ($script:OctaneSession -and $script:OctaneSession.Expires -gt (Get-Date).AddMinutes(2)) {
+        if (-not $Owner -or $script:OctaneSession.IsOwner) { return $script:OctaneSession }
+    }
+    Write-Host ''
+    Write-Host ($(if ($Owner) { 'Sign in with the Octane owner account.' } else { 'Sign in with your Octane account.' })) -ForegroundColor Cyan
+    $email = Read-Host 'Email'
+    if ([string]::IsNullOrWhiteSpace($email)) { return $null }
+    $secure = Read-Host 'Password' -AsSecureString
+    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+    try { $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) } finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+    $body = @{ email = $email.Trim(); password = $plain } | ConvertTo-Json
+    $plain = $null
+    try {
+        $res = Invoke-RestMethod -Method Post -Uri "$($script:OctaneSupabaseUrl)/auth/v1/token?grant_type=password" -Headers @{ apikey = $script:OctaneAnonKey } -ContentType 'application/json' -Body $body -TimeoutSec 20
+    } catch {
+        Write-Host ("Sign-in failed: {0}" -f (Get-OctaneApiError $_)) -ForegroundColor Red
+        return $null
+    }
+    $session = [pscustomobject]@{
+        Token = $res.access_token
+        UserId = [string]$res.user.id
+        Email = [string]$res.user.email
+        Expires = (Get-Date).AddSeconds([int]$res.expires_in)
+        IsOwner = $false
+        License = $null
+    }
+    $script:OctaneSession = $session
+    $lic = Invoke-OctaneLicenseClaim
+    if ($lic) {
+        $session.License = $lic
+        $session.IsOwner = [bool]$lic.is_owner
+    }
+    if ($Owner -and -not $session.IsOwner) {
+        Write-Host 'That account is not the Octane owner.' -ForegroundColor Red
+        return $null
+    }
+    Write-Host ("Signed in as {0}." -f $session.Email) -ForegroundColor Green
+    return $session
+}
+
+function Invoke-OctaneRpc {
+    param([string]$Name, [hashtable]$Body = @{})
+    $s = $script:OctaneSession
+    Invoke-RestMethod -Method Post -Uri "$($script:OctaneSupabaseUrl)/rest/v1/rpc/$Name" -Headers @{ apikey = $script:OctaneAnonKey; Authorization = "Bearer $($s.Token)" } -ContentType 'application/json' -Body ($Body | ConvertTo-Json -Depth 5) -TimeoutSec 20
+}
+
+function Invoke-OctaneLicenseClaim {
+    $first = $null
+    try {
+        $p = Get-ItemProperty $script:OctaneAnchorKey -Name FirstSeen -ErrorAction Stop
+        $first = [string]$p.FirstSeen
+    } catch { }
+    $body = @{ p_machine_id = (Get-OctaneMachineId); p_machine_name = $env:COMPUTERNAME; p_app_version = "cli-$($script:Version)" }
+    if ($first) { $body.p_local_first_login = $first }
+    try { return Invoke-OctaneRpc -Name 'octane_license_claim' -Body $body }
+    catch {
+        $code = $null
+        try { $code = [int]$_.Exception.Response.StatusCode } catch { }
+        if ($code -eq 404) { Write-Host 'The license service is not set up yet (supabase/licenses.sql).' -ForegroundColor Yellow }
+        else { Write-Host ("License check failed: {0}" -f (Get-OctaneApiError $_)) -ForegroundColor Yellow }
+        return $null
+    }
+}
+
+function Write-OctaneLicense {
+    param($License)
+    if (-not $License) { return }
+    $exp = [DateTime]::Parse([string]$License.expires_at).ToLocalTime()
+    $first = [DateTime]::Parse([string]$License.first_login_at).ToLocalTime()
+    Write-Host ''
+    Write-Host ("Account:       {0}" -f $License.email)
+    Write-Host ("First sign-in: {0}" -f $first.ToString('yyyy-MM-dd HH:mm'))
+    if ($License.is_owner) {
+        Write-Host 'License:       Owner (never expires)' -ForegroundColor Green
+        return
+    }
+    $left = $exp - (Get-Date)
+    if ($left.TotalSeconds -gt 0) {
+        Write-Host ("License:       active until {0} ({1} days left)" -f $exp.ToString('yyyy-MM-dd HH:mm'), [math]::Floor($left.TotalDays)) -ForegroundColor Green
+    } else {
+        Write-Host ("License:       EXPIRED on {0}. Ask the owner to renew." -f $exp.ToString('yyyy-MM-dd HH:mm')) -ForegroundColor Red
+    }
+}
+
+function Invoke-OctaneStorage {
+    param([string]$Method = 'GET', [string]$Path, [string]$InFile, [string]$OutFile, [hashtable]$Extra = @{}, $Body)
+    $s = $script:OctaneSession
+    $headers = @{ apikey = $script:OctaneAnonKey; Authorization = "Bearer $($s.Token)" }
+    foreach ($k in $Extra.Keys) { $headers[$k] = $Extra[$k] }
+    $uri = "$($script:OctaneSupabaseUrl)/storage/v1/$Path"
+    $args2 = @{ Method = $Method; Uri = $uri; Headers = $headers; TimeoutSec = 60 }
+    if ($InFile) { $args2.InFile = $InFile; $args2.ContentType = 'application/json' }
+    if ($OutFile) { $args2.OutFile = $OutFile }
+    if ($null -ne $Body) { $args2.Body = ($Body | ConvertTo-Json -Depth 5); $args2.ContentType = 'application/json' }
+    Invoke-RestMethod @args2
+}
+
+function Read-OctaneTemplates {
+    param([string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return @() }
+    $data = $Text | ConvertFrom-Json
+    if ($data -is [array]) { return @($data) }
+    if ($data.templates) { return @($data.templates) }
+    return @()
+}
+
+function Write-Utf8NoBom {
+    param([string]$Path, [string]$Text)
+    $dir = Split-Path $Path -Parent
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+    [IO.File]::WriteAllText($Path, $Text, (New-Object Text.UTF8Encoding($false)))
+}
+
+# Pack wins on id or name clashes; this PC's other templates are kept.
+function Merge-OctaneTemplates {
+    param([object[]]$Pack = @(), [object[]]$Local = @())
+    $ids = @{}; $names = @{}
+    foreach ($t in $Pack) { $ids[[string]$t.id] = $true; $names[([string]$t.name).ToLowerInvariant()] = $true }
+    $kept = @($Local | Where-Object { -not $ids.ContainsKey([string]$_.id) -and -not $names.ContainsKey(([string]$_.name).ToLowerInvariant()) })
+    return [pscustomobject]@{ Merged = @(@($Pack) + @($kept)); Kept = $kept.Count }
+}
+
+function Test-OctaneRunning { return [bool](Get-Process -Name 'Octane' -ErrorAction SilentlyContinue) }
+
+# --- menu actions ----------------------------------------------------------
+
+function Show-OctaneInstall {
+    Clear-Host
+    Write-Host 'Install / update Octane' -ForegroundColor Cyan
+    Write-Host ''
+    $inst = Get-OctaneInstall
+    $latest = Get-OctaneLatestRelease
+    Write-Host ("Installed: {0}" -f $(if ($inst) { $inst.Version } else { 'not installed' }))
+    Write-Host ("Latest:    {0}" -f $(if ($latest) { $latest.Version } else { 'could not check (offline?)' }))
+    Write-Host ''
+    if ($inst -and $latest -and $inst.Version -eq $latest.Version) {
+        Write-Host 'Octane is up to date. Install again anyway?' -ForegroundColor Green
+    }
+    Write-Host 'Installs for this Windows user, no administrator prompt.'
+    Write-Host 'Logs, templates, settings and your sign-in are kept.' -ForegroundColor Green
+    Write-Host ''
+    $answer = Read-Host '[Y] Install  [N] Back'
+    if ($answer -notmatch '^[Yy]') { return }
+    Write-Host ''
+    if (Test-OctaneRunning) {
+        Write-Host 'Closing Octane first...'
+        Get-Process -Name 'Octane' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 2
+    }
+    try {
+        Uninstall-PreviousOctane
+        Install-LatestOctane
+    } catch {
+        Write-Host $_.Exception.Message -ForegroundColor Red
+    }
+    Wait-Enter
+}
+
+function Show-OctaneRepair {
+    Clear-Host
+    Write-Host 'Check & repair Octane' -ForegroundColor Cyan
+    Write-Host ''
+    $problems = 0
+    $needsReinstall = $false
+    $ok = { param($t) Write-Host ("  OK    {0}" -f $t) -ForegroundColor Green }
+    $bad = { param($t) Write-Host ("  FIX   {0}" -f $t) -ForegroundColor Yellow }
+
+    $inst = Get-OctaneInstall
+    if (-not $inst) {
+        & $bad 'Octane is not installed.'
+        $problems++; $needsReinstall = $true
+    } else {
+        $exe = Join-Path $inst.Dir 'Octane.exe'
+        $asar = Join-Path $inst.Dir 'resources\app.asar'
+        $lic = Join-Path $inst.Dir 'resources\LICENSE'
+        if (Test-Path -LiteralPath $exe) { & $ok ("Octane {0} at {1}" -f $inst.Version, $inst.Dir) } else { & $bad 'Octane.exe is missing.'; $problems++; $needsReinstall = $true }
+        if (Test-Path -LiteralPath $asar) { & $ok 'App files present' } else { & $bad 'App files (app.asar) are missing.'; $problems++; $needsReinstall = $true }
+        if (Test-Path -LiteralPath $lic) { & $ok 'LICENSE present' } else { & $bad 'LICENSE file is missing.'; $problems++; $needsReinstall = $true }
+        $latest = Get-OctaneLatestRelease
+        if ($latest -and $latest.Version -ne $inst.Version) { & $bad ("Update available: {0} -> {1}" -f $inst.Version, $latest.Version); $problems++; $needsReinstall = $true }
+        elseif ($latest) { & $ok 'Latest version' }
+    }
+
+    $tpl = Get-OctaneTemplatesPath
+    if (Test-Path -LiteralPath $tpl) {
+        try {
+            $null = Read-OctaneTemplates -Text ([IO.File]::ReadAllText($tpl))
+            & $ok 'Templates file is valid'
+        } catch {
+            $stamp = (Get-Date).ToString('yyyyMMdd-HHmmss')
+            $bak = Get-ChildItem -Path (Split-Path $tpl -Parent) -Filter 'templates.json.bak-*' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            Move-Item -LiteralPath $tpl -Destination "$tpl.corrupt-$stamp" -Force
+            if ($bak) { Copy-Item -LiteralPath $bak.FullName -Destination $tpl -Force; & $bad ("Templates file was damaged; restored {0}" -f $bak.Name) }
+            else { & $bad 'Templates file was damaged; Octane will rebuild the built-in templates on next start' }
+            $problems++
+        }
+    } else { & $ok 'No templates file yet (Octane creates it on first start)' }
+
+    $session = Join-Path $env:APPDATA 'Octane\auth-session.dat'
+    if ((Test-Path -LiteralPath $session) -and (Get-Item -LiteralPath $session).Length -eq 0) {
+        Remove-Item -LiteralPath $session -Force
+        & $bad 'Empty sign-in file removed (sign in again)'
+        $problems++
+    } else { & $ok 'Sign-in file' }
+
+    try {
+        $p = Get-ItemProperty $script:OctaneAnchorKey -ErrorAction Stop
+        & $ok ("License lock on this PC since {0}" -f $p.FirstSeen)
+    } catch {
+        & $bad 'This PC has no license lock yet (use "Verify & lock license on this PC")'
+    }
+
+    Write-Host ''
+    if ($problems -eq 0) { Write-Host 'Everything looks good.' -ForegroundColor Green }
+    if ($needsReinstall) {
+        $answer = Read-Host '[Y] Reinstall the latest Octane now  [N] Back'
+        if ($answer -match '^[Yy]') {
+            try {
+                if (Test-OctaneRunning) { Get-Process -Name 'Octane' | Stop-Process -Force; Start-Sleep -Seconds 2 }
+                Uninstall-PreviousOctane
+                Install-LatestOctane
+            } catch { Write-Host $_.Exception.Message -ForegroundColor Red }
+        }
+    }
+    Wait-Enter
+}
+
+function Get-OctaneAnchorCommand {
+    # Runs elevated: creates the machine license anchor once and makes it read-only for users.
+    @'
+$ErrorActionPreference = 'Stop'
+$path = 'HKLM:\SOFTWARE\EverlastingDev\Octane'
+if (-not (Test-Path $path)) { New-Item -Path $path -Force | Out-Null }
+$p = Get-ItemProperty -Path $path -ErrorAction SilentlyContinue
+if (-not $p.FirstSeen) { New-ItemProperty -Path $path -Name FirstSeen -PropertyType String -Value ((Get-Date).ToUniversalTime().ToString('o')) -Force | Out-Null }
+if (-not $p.MachineId) { New-ItemProperty -Path $path -Name MachineId -PropertyType String -Value '__MACHINEID__' -Force | Out-Null }
+$acl = Get-Acl $path
+$acl.SetAccessRuleProtection($true, $false)
+foreach ($r in @($acl.Access)) { [void]$acl.RemoveAccessRule($r) }
+$full = [Security.AccessControl.RegistryRights]::FullControl
+$read = [Security.AccessControl.RegistryRights]::ReadKey
+$inh = [Security.AccessControl.InheritanceFlags]::ContainerInherit
+$none = [Security.AccessControl.PropagationFlags]::None
+$allow = [Security.AccessControl.AccessControlType]::Allow
+foreach ($sid in @('S-1-5-18', 'S-1-5-32-544')) {
+    $acl.AddAccessRule((New-Object Security.AccessControl.RegistryAccessRule((New-Object Security.Principal.SecurityIdentifier($sid)), $full, $inh, $none, $allow)))
+}
+foreach ($sid in @('S-1-5-32-545', 'S-1-5-11')) {
+    $acl.AddAccessRule((New-Object Security.AccessControl.RegistryAccessRule((New-Object Security.Principal.SecurityIdentifier($sid)), $read, $inh, $none, $allow)))
+}
+Set-Acl -Path $path -AclObject $acl
+'@ -replace '__MACHINEID__', (Get-OctaneMachineId)
+}
+
+function Show-OctaneLicenseLock {
+    Clear-Host
+    Write-Host 'Verify & lock license on this PC' -ForegroundColor Cyan
+    Write-Host ''
+    Write-Host 'Each Octane account has 15 days from its first ever sign-in.'
+    Write-Host 'Locking this PC stores a permanent first-seen date that standard'
+    Write-Host 'users cannot change, so reinstalling or deleting app data never'
+    Write-Host 'restarts the clock. Windows asks for administrator approval once.'
+    Write-Host ''
+    $existing = $null
+    try { $existing = Get-ItemProperty $script:OctaneAnchorKey -ErrorAction Stop } catch { }
+    if ($existing) {
+        Write-Host ("This PC is locked since {0}." -f $existing.FirstSeen) -ForegroundColor Green
+    } else {
+        $answer = Read-Host '[Y] Lock this PC (admin prompt)  [N] Skip'
+        if ($answer -match '^[Yy]') {
+            $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes((Get-OctaneAnchorCommand)))
+            try {
+                $proc = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $encoded) -Verb RunAs -Wait -PassThru -WindowStyle Hidden
+                if ($proc.ExitCode -eq 0) { Write-Host 'This PC is now locked.' -ForegroundColor Green }
+                else { Write-Host ("The lock did not finish (exit {0})." -f $proc.ExitCode) -ForegroundColor Yellow }
+            } catch {
+                Write-Host 'Administrator approval was declined, so the lock was not set.' -ForegroundColor Yellow
+            }
+        }
+    }
+    Write-Host ''
+    $answer = Read-Host '[Y] Check my account license  [N] Back'
+    if ($answer -match '^[Yy]') {
+        $s = Connect-OctaneAccount
+        if ($s) { Write-OctaneLicense $s.License }
+    }
+    Wait-Enter
+}
+
+function Show-OctaneTemplatePack {
+    Clear-Host
+    Write-Host 'Get template pack' -ForegroundColor Cyan
+    Write-Host ''
+    Write-Host 'Installs the shared Octane template pack on this PC.'
+    Write-Host 'First, this PC''s current templates are backed up privately to the'
+    Write-Host 'Octane owner and to a local .bak file. Templates with the same name'
+    Write-Host 'are replaced by the pack; your other templates are kept.'
+    Write-Host ''
+    $answer = Read-Host '[Y] Continue  [N] Back'
+    if ($answer -notmatch '^[Yy]') { return }
+    $s = Connect-OctaneAccount
+    if (-not $s) { Wait-Enter; return }
+    $tpl = Get-OctaneTemplatesPath
+    $stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMdd-HHmmss')
+    $local = @()
+    try {
+        if (Test-Path -LiteralPath $tpl) {
+            $text = [IO.File]::ReadAllText($tpl)
+            Copy-Item -LiteralPath $tpl -Destination "$tpl.bak-$stamp" -Force
+            $local = @(Read-OctaneTemplates -Text $text)
+            $name = ('{0}/{1}-{2}.json' -f $s.UserId, ($env:COMPUTERNAME -replace '[^A-Za-z0-9_-]', '_'), $stamp)
+            Invoke-OctaneStorage -Method Post -Path "object/octane-template-backups/$name" -InFile $tpl | Out-Null
+            Write-Host ("Backed up {0} template(s) from this PC." -f $local.Count) -ForegroundColor Green
+        } else {
+            Write-Host 'No templates on this PC yet; nothing to back up.'
+        }
+    } catch {
+        Write-Host ("Backup failed, nothing was changed: {0}" -f (Get-OctaneApiError $_)) -ForegroundColor Red
+        Wait-Enter
+        return
+    }
+    $tmp = Join-Path $env:TEMP "octane-pack-$stamp.json"
+    try {
+        Invoke-OctaneStorage -Path 'object/authenticated/octane-templates/pack.json' -OutFile $tmp | Out-Null
+        $pack = @(Read-OctaneTemplates -Text ([IO.File]::ReadAllText($tmp)))
+    } catch {
+        Write-Host ("Could not download the template pack: {0}" -f (Get-OctaneApiError $_)) -ForegroundColor Red
+        Wait-Enter
+        return
+    } finally {
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+    }
+    if ($pack.Count -eq 0) { Write-Host 'The template pack is empty.' -ForegroundColor Yellow; Wait-Enter; return }
+    $result = Merge-OctaneTemplates -Pack $pack -Local $local
+    Write-Utf8NoBom -Path $tpl -Text (ConvertTo-Json -InputObject @($result.Merged) -Depth 12)
+    Write-Host ("Installed {0} template(s) from the pack, kept {1} of your own." -f $pack.Count, $result.Kept) -ForegroundColor Green
+    if (Test-OctaneRunning) { Write-Host 'Restart Octane to see them.' -ForegroundColor Yellow }
+    Wait-Enter
+}
+
+function Show-OctanePublishPack {
+    Clear-Host
+    Write-Host 'Publish my template pack (owner)' -ForegroundColor Cyan
+    Write-Host ''
+    $tpl = Get-OctaneTemplatesPath
+    if (-not (Test-Path -LiteralPath $tpl)) { Write-Host 'This PC has no Octane templates file.' -ForegroundColor Yellow; Wait-Enter; return }
+    try { $list = @(Read-OctaneTemplates -Text ([IO.File]::ReadAllText($tpl))) } catch { Write-Host 'The templates file on this PC is damaged.' -ForegroundColor Red; Wait-Enter; return }
+    Write-Host ("This PC has {0} template(s):" -f $list.Count)
+    foreach ($t in $list) { Write-Host ("  - {0}" -f $t.name) }
+    Write-Host ''
+    Write-Host 'They become the pack every other PC downloads.'
+    $answer = Read-Host '[Y] Publish  [N] Back'
+    if ($answer -notmatch '^[Yy]') { return }
+    $s = Connect-OctaneAccount -Owner
+    if (-not $s) { Wait-Enter; return }
+    try {
+        Invoke-OctaneStorage -Method Post -Path 'object/octane-templates/pack.json' -InFile $tpl -Extra @{ 'x-upsert' = 'true' } | Out-Null
+        Write-Host 'Template pack published.' -ForegroundColor Green
+    } catch {
+        Write-Host ("Publishing failed: {0}" -f (Get-OctaneApiError $_)) -ForegroundColor Red
+    }
+    Wait-Enter
+}
+
+function Show-OctaneCollectBackups {
+    Clear-Host
+    Write-Host 'Collect template backups (owner)' -ForegroundColor Cyan
+    Write-Host ''
+    $s = Connect-OctaneAccount -Owner
+    if (-not $s) { Wait-Enter; return }
+    $emails = @{}
+    try { foreach ($a in @(Invoke-OctaneRpc -Name 'octane_license_list')) { $emails[[string]$a.user_id] = [string]$a.email } } catch { }
+    $root = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'Octane template backups'
+    $count = 0
+    try {
+        $folders = @(Invoke-OctaneStorage -Method Post -Path 'object/list/octane-template-backups' -Body @{ prefix = ''; limit = 1000 })
+        foreach ($f in $folders) {
+            $uid = [string]$f.name
+            if (-not $uid) { continue }
+            $who = if ($emails.ContainsKey($uid)) { $emails[$uid] } else { $uid }
+            $dir = Join-Path $root ($who -replace '[\\/:*?"<>|]', '_')
+            New-Item -ItemType Directory -Force -Path $dir | Out-Null
+            $files = @(Invoke-OctaneStorage -Method Post -Path 'object/list/octane-template-backups' -Body @{ prefix = "$uid/"; limit = 1000 })
+            foreach ($file in $files) {
+                if (-not $file.id) { continue }
+                $target = Join-Path $dir $file.name
+                if (Test-Path -LiteralPath $target) { continue }
+                Invoke-OctaneStorage -Path "object/authenticated/octane-template-backups/$uid/$($file.name)" -OutFile $target | Out-Null
+                $count++
+            }
+        }
+        Write-Host ("Downloaded {0} new backup file(s) to {1}" -f $count, $root) -ForegroundColor Green
+        if (Test-Path -LiteralPath $root) { Start-Process explorer.exe $root }
+    } catch {
+        Write-Host ("Could not collect backups: {0}" -f (Get-OctaneApiError $_)) -ForegroundColor Red
+    }
+    Wait-Enter
+}
+
+function Show-OctaneUninstall {
+    Clear-Host
+    Write-Host 'Uninstall Octane' -ForegroundColor Cyan
+    Write-Host ''
+    Write-Host 'Removes the Octane app from this PC. Your logs, templates and the'
+    Write-Host 'license lock stay, so reinstalling later carries on where you left off.'
+    Write-Host ''
+    $answer = Read-Host '[Y] Uninstall  [N] Back'
+    if ($answer -notmatch '^[Yy]') { return }
+    if (Test-OctaneRunning) { Get-Process -Name 'Octane' | Stop-Process -Force; Start-Sleep -Seconds 2 }
+    Uninstall-PreviousOctane
+    Write-Host 'Done.' -ForegroundColor Green
+    Wait-Enter
+}
+
+function Show-OctaneMenu {
+    while ($true) {
+        $inst = Get-OctaneInstall
+        $status = if ($inst) { "Octane $($inst.Version) installed" } else { 'Octane is not installed' }
+        $pick = Read-ArrowMenu -Title 'Octane' -Lines @(
+            "This PC: $env:COMPUTERNAME",
+            $status
+        ) -Items @(
+            'Install / update Octane',
+            'Check & repair Octane',
+            'Verify & lock license on this PC',
+            'Get template pack',
+            'Publish my template pack (owner)',
+            'Collect template backups (owner)',
+            'Uninstall Octane'
+        ) -Descriptions @(
+            'Download the latest Octane release and install it. Keeps your logs, templates and sign-in.',
+            'Check the install, version, LICENSE, templates and sign-in files, and fix what is broken.',
+            'Lock this PC''s license start date (admin prompt) and show your account''s days left.',
+            'Back up this PC''s templates to the owner, then install the shared template pack.',
+            'Owner only: make this PC''s templates the pack every other PC downloads.',
+            'Owner only: download every PC''s backed-up templates into Documents.',
+            'Remove the Octane app. Logs, templates and the license lock stay.'
+        ) -SeparatorsAfter @(2, 5) -ZeroLabel 'Back' -Hint 'Arrows move. Enter chooses. A number chooses too. 0 goes back.'
+        switch ($pick) {
+            0 { Show-OctaneInstall }
+            1 { Show-OctaneRepair }
+            2 { Show-OctaneLicenseLock }
+            3 { Show-OctaneTemplatePack }
+            4 { Show-OctanePublishPack }
+            5 { Show-OctaneCollectBackups }
+            6 { Show-OctaneUninstall }
+            default { return }
+        }
+    }
+}
+
 function Show-Launcher {
     while ($true) {
         $status = if (Test-SlipInstalled) { "$($script:AppName): installed" } else { "$($script:AppName): not installed" }
         $second = if (Test-SlipInstalled) { "Open $($script:AppName)" } else { "Get $($script:AppName)" }
+        $secondDesc = if (Test-SlipInstalled) {
+            'Send and receive files and chat with PCs on this network.'
+        } else {
+            'Install Slip: send files and chat between PCs on the same network.'
+        }
+        $oct = Get-OctaneInstall
         $pick = Read-ArrowMenu -Title 'everlasting-dev' -Lines @(
             "This PC: $env:COMPUTERNAME",
+            ("Octane: {0}" -f $(if ($oct) { "$($oct.Version) installed" } else { 'not installed' })),
             $status,
             ("Slip {0}" -f $script:Version)
         ) -Items @(
-            'Get Octane',
+            'Octane',
             $second,
             'Quit'
+        ) -Descriptions @(
+            'ECU log viewer: install or update, check and repair, license lock and template pack.',
+            $secondDesc,
+            'Close this window.'
         ) -ZeroLabel 'Quit' -Hint 'Arrows move. Enter chooses. A number chooses too. 0 quits.'
         switch ($pick) {
-            0 { Invoke-GetOctane }
+            0 { Show-OctaneMenu }
             1 {
                 if (Test-SlipInstalled) { Show-SlipMenu -CanReturn }
                 else { Invoke-GetSlipFromLauncher }
@@ -4760,6 +5333,7 @@ function Get-EntryOptions {
     while ($i -lt $pending.Count) {
         $token = [string]$pending[$i]
         if ($token -eq 'menu') { $o.Entry = 'menu' }
+        elseif ($token -eq 'octane') { $o.Entry = 'octane' }
         elseif ($token -eq 'firewall') { $o.Entry = 'firewall' }
         elseif ($token -eq 'unfirewall') { $o.Entry = 'unfirewall' }
         elseif ($token -eq 'netprivate') { $o.Entry = 'netprivate' }
@@ -5074,5 +5648,6 @@ switch ($script:Opt.Entry) {
         }
     }
     'menu' { Show-SlipMenu }
+    'octane' { Show-OctaneMenu }
     default { Show-Launcher }
 }

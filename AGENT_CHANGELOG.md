@@ -3,6 +3,13 @@
 Internal handoff log for Cursor agents and plugins. Newest entries first.
 Read before editing; append after substantive changes.
 
+## 2026-10-03 - publish Slip 0.0.11 with the Octane menu
+
+- **Why:** one open menu for both apps: install/update and repair Octane, lock its license on a PC, share the Octane template pack, and a short description for every option
+- **Changes:** replaced `get` with version 0.0.11. Launcher shows Octane and Slip. The Octane menu has Install / update, Check & repair, Verify & lock license on this PC (admin prompt, read-only HKLM\SOFTWARE\EverlastingDev\Octane), Get template pack (backs up the PC's templates to the owner first), Publish my template pack and Collect template backups (owner), and Uninstall. Every Slip and Octane menu shows a one-line description for the highlighted option (inline when typing numbers). `slip octane` opens the Octane menu directly. Old Octane installs are now found by their versioned name ("Octane 0.9.5").
+- **Files:** `get`, `README.md`, `AGENT_CHANGELOG.md`
+- **Notes:** account features need `octane/supabase/licenses.sql` run in Supabase. Source of truth is `Documents\project Z\lanfile.ps1`.
+
 ## 2026-10-02 - reopen the menu after Diagnostics updates
 
 - **Why:** Check and fix installed the downloaded version correctly, but then returned to the already-running menu process, whose in-memory version and code remained old until the user closed and reopened Slip.
