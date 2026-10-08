@@ -12,7 +12,7 @@ $script:RawArgs = @($args)
 $script:RuleTcp = "$($script:AppName) TCP"
 $script:RuleUdp = "$($script:AppName) Discovery"
 $script:BeaconPrefix = $script:AppName.ToUpperInvariant() + '1'
-$script:Version = '0.0.11'
+$script:Version = '0.0.12'
 
 function Initialize-SlipSecurityProtocol {
     try {
@@ -349,20 +349,22 @@ To send
   1. Copy the files into Documents\$($script:AppName)\Outbox.
   2. Run: $($script:CommandName)
   3. Choose 1, Send files. Uncheck anything you do not want. Confirm.
-  4. Leave this window open. Read the PIN to the other PC.
+  4. Pick a Quick receive PC, or choose Send with PIN.
+     For PIN transfers, leave this window open until the download finishes.
 
 To receive
   1. Run: $($script:CommandName)
-  2. Choose Receive files. Pick the other PC. Type the PIN.
+  2. Choose Receive files > Receive with a PIN, or turn Quick receive on.
   3. Files are saved in Documents\$($script:AppName)\Inbox.
 
 Both PCs must be on the same Wi-Fi or LAN. The names you see are
 display names, not the Windows computer names.
 Close the sender only after the receiver says the download finished.
 
-Quick receive is off unless you turn it on under More.
+Quick receive is off unless you turn it on under Settings.
 When it is on, the other PC can choose Send now and skip the PIN.
-The file lands in Inbox, and Inbox opens.
+The file lands in Inbox. An existing Inbox window is brought forward.
+Shortcut: select files in Explorer, then Send to > Slip.
 
 Menus use the arrow keys and Enter. A number still chooses that item.
 On the file list, arrows move the row and Space toggles it.
@@ -374,8 +376,10 @@ function Get-SendStepsText {
 To send
   1. Copy the files into Documents\$($script:AppName)\Outbox.
   2. Uncheck anything you do not want.
-  3. Confirm the list.
-  4. Leave this window open and read the PIN to the other PC.
+  3. Confirm the list and choose a receiving PC.
+  Use Send with PIN if the other PC has Quick receive off.
+
+Shortcut: select files in Explorer, then Send to > Slip.
 "@
 }
 
@@ -634,12 +638,65 @@ function Update-InstalledSlipScript {
     Invoke-RestMethod -Uri $script:SourceUrl -OutFile $target -ErrorAction Stop
 }
 
+function Get-BackgroundLauncherPath { Join-Path (Get-SlipCommandDir) 'slip-background-v1.exe' }
+
+function Install-BackgroundLauncher {
+    $path = Get-BackgroundLauncherPath
+    if (Test-Path -LiteralPath $path) { return }
+    New-Item -ItemType Directory -Path (Split-Path -Parent $path) -Force | Out-Null
+    # A GUI-subsystem executable never allocates a console, including at logon.
+    # Do not shell-expand paths or accept arbitrary commands from startup entries.
+    $source = @'
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Threading;
+public static class SlipBackground {
+    [STAThread]
+    public static int Main(string[] args) {
+        if (args.Length != 1 || Array.IndexOf(new[] { "listen", "chatlisten", "remotehelp", "updatecheck" }, args[0]) < 0) return 2;
+        bool created;
+        using (var gate = new Mutex(true, "Local\\Slip.Background." + args[0], out created)) {
+            if (!created && !gate.WaitOne(3000)) return 0;
+            try {
+                string script = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "slip-host.ps1");
+                var start = new ProcessStartInfo {
+                    FileName = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), @"WindowsPowerShell\v1.0\powershell.exe"),
+                    Arguments = "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File \"" + script + "\" " + args[0],
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    WindowStyle = ProcessWindowStyle.Hidden
+                };
+                using (var child = Process.Start(start)) { child.WaitForExit(); return child.ExitCode; }
+            } catch (Exception ex) {
+                try { File.AppendAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "background-errors.log"), DateTime.Now + " " + ex.Message + Environment.NewLine); } catch { }
+                return 1;
+            } finally { gate.ReleaseMutex(); }
+        }
+    }
+}
+'@
+    Add-Type -TypeDefinition $source -Language CSharp -OutputAssembly $path -OutputType WindowsApplication -ErrorAction Stop
+}
+
+function Get-BackgroundCommandLine {
+    param([ValidateSet('listen', 'chatlisten', 'remotehelp', 'updatecheck')][string]$Entry)
+    return ('"{0}" {1}' -f (Get-BackgroundLauncherPath), $Entry)
+}
+
+function Start-SlipBackground {
+    param([ValidateSet('listen', 'chatlisten', 'remotehelp', 'updatecheck')][string]$Entry)
+    Install-BackgroundLauncher
+    Start-Process -FilePath (Get-BackgroundLauncherPath) -ArgumentList $Entry -WindowStyle Hidden -PassThru -ErrorAction Stop
+}
+
 function Install-SlipCommand {
     $dir = Get-SlipCommandDir
     if (-not (Test-Path -LiteralPath $dir)) {
         New-Item -ItemType Directory -Force -Path $dir | Out-Null
     }
     Update-InstalledSlipScript
+    Install-BackgroundLauncher
     $installedScript = Get-InstalledScriptPath
     $menuTemplate = @'
 @echo off
@@ -721,7 +778,7 @@ function Remove-SlipCommand {
     Remove-SendToShortcut
     $dir = Get-SlipCommandDir
     $shim = Get-SlipShimDir
-    foreach ($name in @("$($script:CommandName).cmd", "$($script:CommandName)-listen.cmd", "$($script:CommandName).ps1", "$($script:CommandName)-host.ps1")) {
+    foreach ($name in @('slip-background-v1.exe', 'background-errors.log', "$($script:CommandName).cmd", "$($script:CommandName)-listen.cmd", "$($script:CommandName).ps1", "$($script:CommandName)-host.ps1")) {
         $path = Join-Path $dir $name
         if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
     }
@@ -950,12 +1007,13 @@ function Invoke-UnattendedUpgrade {
     }
     Write-SlipLog "Upgrade applying fetched payload. version=$($script:Version) source=$($script:SourceUrl)."
     $quickShouldRun = $QuickReceive -or (Test-QuickReceive)
+    $chatShouldRun = Test-AutoChat
     $remoteHelpShouldRun = Test-RemoteHelp
     Stop-QuickReceive
     Stop-AutoChat
     Stop-RemoteHelp -KeepSetting
     $ok = Complete-SlipSetup -DisplayName $name -Quiet:$Quiet -NoPrompt -MakeNetworkPrivate:$MakeNetworkPrivate
-    Enable-AutoChat -Quiet:$Quiet
+    if ($chatShouldRun) { Enable-AutoChat -Quiet:$Quiet }
     if ($quickShouldRun) {
         Enable-QuickReceive -Quiet:$Quiet
     } else {
@@ -964,7 +1022,7 @@ function Invoke-UnattendedUpgrade {
     }
     if ($remoteHelpShouldRun) { Enable-RemoteHelp -Quiet }
     if ((Get-UpdateReminderState).Enabled) { [void](Register-UpdateReminderTask) }
-    Write-SlipLog "Upgrade completed. version=$($script:Version) setupOk=$([bool]$ok) quickReceive=$([bool]$quickShouldRun) autoChat=true remoteHelp=$([bool]$remoteHelpShouldRun)."
+    Write-SlipLog "Upgrade completed. version=$($script:Version) setupOk=$([bool]$ok) quickReceive=$([bool]$quickShouldRun) autoChat=$chatShouldRun remoteHelp=$([bool]$remoteHelpShouldRun)."
     if ($menuParentProcessId -gt 0) {
         if (Start-SlipMenuReplacement -ParentProcessId $menuParentProcessId -WaitProcessId $PID) {
             Write-SlipLog "Upgrade scheduled menu replacement. parentPid=$menuParentProcessId helperWaitPid=$PID."
@@ -974,7 +1032,7 @@ function Invoke-UnattendedUpgrade {
         Write-Host "$($script:AppName) $($script:Version) is installed." -ForegroundColor Green
         Write-Host ("Shown as: {0}" -f (Get-DisplayName))
         Write-Host "Command: $($script:CommandName)"
-        Write-Host 'Auto chat: on'
+        if ($chatShouldRun) { Write-Host 'Auto chat: on' } else { Write-Host 'Auto chat: off' }
         if ($quickShouldRun) { Write-Host 'Quick receive: on' } else { Write-Host 'Quick receive: off' }
         Write-Host "Type $($script:CommandName) again in this window."
         if (-not $ok) {
@@ -997,7 +1055,7 @@ function Show-NetworkWarning {
         Write-Host ("This network ({0}) is {1}. The {2} rules only apply to Private" -f $item.Name, $item.NetworkCategory, $script:AppName) -ForegroundColor Yellow
         Write-Host 'networks, so other PCs cannot reach this one yet.' -ForegroundColor Yellow
     }
-        Write-Host 'Diagnostics has Network: make Private, which fixes this.' -ForegroundColor Yellow
+        Write-Host 'Settings > Network lets you mark a trusted network Private.' -ForegroundColor Yellow
 }
 
 function Invoke-MakeNetworkPrivate {
@@ -1204,7 +1262,7 @@ function Show-Status {
         Write-Host 'Receiving:    blocked, this PC is not on a network.' -ForegroundColor Red
     } elseif ($public.Count -gt 0) {
         Write-Host 'Receiving:    blocked, this network is not Private.' -ForegroundColor Red
-        Write-Host '              Diagnostics has Network: make Private.' -ForegroundColor DarkGray
+        Write-Host '              Open Settings > Network to change this.' -ForegroundColor DarkGray
     } else {
         Write-Host 'Receiving:    ready' -ForegroundColor Green
     }
@@ -1374,7 +1432,7 @@ function Open-Folder {
         New-Item -ItemType Directory -Force -Path $Path | Out-Null
     }
     $full = [IO.Path]::GetFullPath($Path)
-    if (-not $Force -and (Focus-ExplorerFolder -FolderPath $full)) { return }
+    if (Focus-ExplorerFolder -FolderPath $full) { return }
     if (Start-ExplorerWindow -Argument ("`"{0}`"" -f $full)) {
         Start-Sleep -Milliseconds 500
         [void](Focus-ExplorerFolder -FolderPath $full)
@@ -1391,7 +1449,7 @@ function Open-ContainingFolder {
         New-Item -ItemType Directory -Force -Path $folder | Out-Null
     }
     if (-not $isFolder -and (Test-Path -LiteralPath $full -PathType Leaf)) {
-        if (-not $Force -and (Focus-ExplorerFolder -FolderPath $folder -SelectPath $full)) { return }
+        if (Focus-ExplorerFolder -FolderPath $folder -SelectPath $full) { return }
         if (Start-ExplorerWindow -Argument ("/select,`"{0}`"" -f $full)) {
             Start-Sleep -Milliseconds 500
             [void](Focus-ExplorerFolder -FolderPath $folder -SelectPath $full)
@@ -1405,10 +1463,15 @@ function Open-ContainingFolder {
 
 function Focus-ExplorerFolder {
     param([string]$FolderPath, [string]$SelectPath)
-    $folder = [IO.Path]::GetFullPath($FolderPath)
+    $folder = [IO.Path]::GetFullPath($FolderPath).TrimEnd('\', '/')
     $select = $null
     if ($SelectPath) { $select = [IO.Path]::GetFullPath($SelectPath) }
     $ps = [PowerShell]::Create()
+    $runspace = [RunspaceFactory]::CreateRunspace()
+    $runspace.ApartmentState = 'STA'
+    $runspace.ThreadOptions = 'ReuseThread'
+    $runspace.Open()
+    $ps.Runspace = $runspace
     [void]$ps.AddScript({
         param($Folder, $Select)
         try {
@@ -1416,7 +1479,7 @@ function Focus-ExplorerFolder {
             foreach ($window in @($shell.Windows())) {
                 try { $location = [string]$window.Document.Folder.Self.Path } catch { continue }
                 if (-not $location) { continue }
-                try { $location = [IO.Path]::GetFullPath($location) } catch { continue }
+                try { $location = [IO.Path]::GetFullPath($location).TrimEnd('\', '/') } catch { continue }
                 if ($location -ine $Folder) { continue }
                 if ($Select) {
                     try {
@@ -1441,7 +1504,7 @@ function Focus-ExplorerFolder {
     }).AddArgument($folder).AddArgument($select)
     $handle = $ps.BeginInvoke()
     $focused = $false
-    if ($handle.AsyncWaitHandle.WaitOne(1500, $false)) {
+    if ($handle.AsyncWaitHandle.WaitOne(5000, $false)) {
         try {
             $result = @($ps.EndInvoke($handle))
             if ($result.Count -gt 0 -and $result[-1]) { $focused = $true }
@@ -1451,6 +1514,7 @@ function Focus-ExplorerFolder {
         try { $ps.Stop() } catch { }
     }
     try { $ps.Dispose() } catch { }
+    try { $runspace.Dispose() } catch { }
     return $focused
 }
 
@@ -2007,7 +2071,7 @@ function Show-SendToSlip {
     if ($targets.Count -eq 0) {
         Write-Host ''
         Write-Host 'No PC with Quick receive was found.' -ForegroundColor Yellow
-        Write-Host 'On the receiving PC: Slip > More > Quick receive: On.'
+        Write-Host 'On the receiving PC: Slip > Settings > Quick receive: On.'
         Write-Host 'Both PCs must be on the same trusted Private network.' -ForegroundColor DarkGray
         Wait-Enter
         return $false
@@ -2254,8 +2318,7 @@ function Get-ListenPidPath { Join-Path (Get-SlipCommandDir) 'listen.pid' }
 function Get-ListenPortPath { Join-Path (Get-SlipCommandDir) 'listen.port' }
 
 function Get-QuickReceiveCommandLine {
-    $scriptPath = Get-InstalledScriptPath
-    return "`"powershell.exe`" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`" listen"
+    return (Get-BackgroundCommandLine 'listen')
 }
 
 function Get-QuickReceiveRunValue {
@@ -2276,10 +2339,33 @@ function Get-QuickListenerPid {
     return 0
 }
 
+function Get-SlipListenerProcess {
+    param([int]$ProcessId, [ValidateSet('listen', 'chatlisten', 'remotehelp')][string]$Entry)
+    if ($ProcessId -le 0 -or $ProcessId -eq $PID) { return $null }
+    # Windows reuses PIDs; do not stop or trust unrelated processes from stale files.
+    $process = Get-CimInstance Win32_Process -Filter "ProcessId = $ProcessId" -ErrorAction SilentlyContinue
+    if (-not $process -or $process.Name -ine 'powershell.exe') { return $null }
+    $path = [regex]::Escape((Get-InstalledScriptPath))
+    if ($process.CommandLine -notmatch ('(?i)-File\s+"' + $path + '"\s+' + $Entry + '(?:\s|$)')) { return $null }
+    return $process
+}
+
+function Stop-SlipListenerProcess {
+    param([int]$ProcessId, [string]$Entry)
+    $owned = Get-SlipListenerProcess -ProcessId $ProcessId -Entry $Entry
+    if ($owned) {
+        Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
+        $parent = Get-CimInstance Win32_Process -Filter "ProcessId = $($owned.ParentProcessId)" -ErrorAction SilentlyContinue
+        if ($parent -and $parent.ExecutablePath -ieq (Get-BackgroundLauncherPath)) {
+            Wait-Process -Id $parent.ProcessId -Timeout 5 -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 function Test-QuickListenerAlive {
     $listenPid = Get-QuickListenerPid
     if ($listenPid -le 0) { return $false }
-    return $null -ne (Get-Process -Id $listenPid -ErrorAction SilentlyContinue)
+    return $null -ne (Get-SlipListenerProcess -ProcessId $listenPid -Entry 'listen')
 }
 
 function Get-QuickListenerPorts {
@@ -2515,7 +2601,8 @@ function Remove-QuickReceiveRunKey {
 
 function Remove-QuickReceiveTask {
     $taskName = Get-QuickTaskName
-    & schtasks.exe /Delete /TN $taskName /F 2>$null | Out-Null
+    $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    if ($task) { Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction Stop }
 }
 
 function Register-QuickReceiveStartup {
@@ -2528,9 +2615,7 @@ function Register-QuickReceiveStartup {
 }
 
 function Start-QuickReceiveProcess {
-    $scriptPath = Get-InstalledScriptPath
-    $args = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`" listen"
-    Start-Process -FilePath powershell.exe -ArgumentList $args -WindowStyle Hidden -ErrorAction Stop | Out-Null
+    Start-SlipBackground 'listen' | Out-Null
 }
 
 function Stop-QuickReceive {
@@ -2542,7 +2627,7 @@ function Stop-QuickReceive {
     if (Test-Path -LiteralPath $pidPath) {
         $listenPid = 0
         if ([int]::TryParse((Get-Content -LiteralPath $pidPath -Raw).Trim(), [ref]$listenPid)) {
-            Stop-Process -Id $listenPid -Force -ErrorAction SilentlyContinue
+            Stop-SlipListenerProcess -ProcessId $listenPid -Entry 'listen'
         }
         Remove-Item -LiteralPath $pidPath -Force -ErrorAction SilentlyContinue
     }
@@ -2731,14 +2816,18 @@ function Start-QuickListener {
                     Write-TransferDebug 'quick.receive.rejected' @{ remote = $remote; reason = 'not quick post'; request = $firstLine }
                     continue
                 }
-                $length = 0L
+                $length = -1L
                 $fileName = "$($script:CommandName)-file.bin"
                 $fileName64 = $null
                 foreach ($line in ($headerText -split "`r`n")) {
-                    if ($line -match '^Content-Length:\s*(\d+)') { $length = [int64]$Matches[1] }
+                    if ($line -match '^Content-Length:\s*(\d+)\s*$') {
+                        if ($length -ge 0) { throw 'Duplicate Content-Length header.' }
+                        $length = [int64]$Matches[1]
+                    }
                     if ($line -match '^X-File-Name:\s*(.+)$') { $fileName = $Matches[1].Trim() }
                     if ($line -match '^X-File-Name64:\s*(.+)$') { $fileName64 = $Matches[1].Trim() }
                 }
+                if ($length -lt 0) { throw 'Missing or invalid Content-Length header.' }
                 if ($fileName64) {
                     try { $fileName = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($fileName64)) } catch { }
                 }
@@ -2749,7 +2838,7 @@ function Start-QuickListener {
                 $inbox = Join-Path $root 'Inbox'
                 if (-not (Test-Path -LiteralPath $inbox)) { New-Item -ItemType Directory -Path $inbox -Force | Out-Null }
                 $dest = Get-UniqueFilePath -Directory $inbox -Name $fileName
-                $output = [IO.File]::Create($dest)
+                $output = [IO.File]::Open($dest, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
                 try {
                     $left = $length
                     $chunk = New-Object byte[] (1024 * 1024)
@@ -2761,7 +2850,10 @@ function Start-QuickListener {
                         $left -= $read
                     }
                 }
-                finally { $output.Dispose() }
+                finally {
+                    $output.Dispose()
+                    if ($left -ne 0) { Remove-Item -LiteralPath $dest -Force -ErrorAction SilentlyContinue }
+                }
                 if ($left -ne 0) {
                     Remove-Item -LiteralPath $dest -Force -ErrorAction SilentlyContinue
                     throw 'The file stopped before it finished.'
@@ -2783,7 +2875,7 @@ function Start-QuickListener {
             }
             if ($savedPath) {
                 try {
-                    Open-ContainingFolder $savedPath -Force
+                    Open-ContainingFolder $savedPath
                 } catch {
                     Write-SlipLog "Could not open Inbox for ${savedPath}: $($_.Exception.Message)"
                 }
@@ -2883,9 +2975,9 @@ function ConvertTo-SafeFileName {
     foreach ($ch in [IO.Path]::GetInvalidFileNameChars()) {
         $leaf = $leaf.Replace([string]$ch, '_')
     }
-    $leaf = $leaf.Trim()
+    $leaf = $leaf.Trim().TrimEnd('.')
     if ([string]::IsNullOrWhiteSpace($leaf)) { $leaf = $Fallback }
-    $base = [IO.Path]::GetFileNameWithoutExtension($leaf)
+    $base = ($leaf -split '\.')[0].TrimEnd()
     if (@('CON', 'PRN', 'AUX', 'NUL', 'COM1', 'COM2', 'COM3', 'COM4', 'COM5', 'COM6', 'COM7', 'COM8', 'COM9', 'LPT1', 'LPT2', 'LPT3', 'LPT4', 'LPT5', 'LPT6', 'LPT7', 'LPT8', 'LPT9') -contains $base.ToUpperInvariant()) {
         $leaf = "_$leaf"
     }
@@ -2921,6 +3013,9 @@ function Save-RemoteFile {
     }
     $client = New-Object System.Net.Http.HttpClient
     $client.Timeout = [TimeSpan]::FromHours(6)
+    $dest = $null
+    $ownsDestination = $false
+    $resp = $null
     try {
         $resp = $client.GetAsync($Url, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
         if (-not $resp.IsSuccessStatusCode) {
@@ -2939,7 +3034,8 @@ function Save-RemoteFile {
         $dest = Get-UniqueFilePath $Directory $name
         Write-TransferDebug 'receive.pin.headers' @{ file = $name; size = $total; path = $dest }
         $inputStream = $resp.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
-        $output = [IO.File]::Create($dest)
+        $output = [IO.File]::Open($dest, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        $ownsDestination = $true
         $last = -1
         $readTotal = 0L
         try {
@@ -2968,14 +3064,36 @@ function Save-RemoteFile {
         Write-TransferDebug 'receive.pin.saved' @{ file = $name; path = $dest; bytes = $readTotal; expected = $total }
         return $dest
     } catch {
+        if ($ownsDestination -and $dest) { Remove-Item -LiteralPath $dest -Force -ErrorAction SilentlyContinue }
         Write-TransferDebug 'receive.pin.failed' @{ error = $_.Exception.Message; directory = $Directory }
         throw
     } finally {
+        if ($resp) { $resp.Dispose() }
         $client.Dispose()
     }
 }
 
 function Show-ReceiveFiles {
+    while ($true) {
+        $state = if (Test-QuickReceive) { 'On' } else { 'Off' }
+        $pick = Read-ArrowMenu -Title 'Receive files' -Lines @(
+            'Received files are saved in your Inbox.',
+            ("Quick receive: {0} (no PIN needed)" -f $state)
+        ) -Items @('Open Inbox', 'Receive with a PIN', ("Quick receive: {0}" -f $state)) -Descriptions @(
+            'See files already received.',
+            'Find a sender and enter the PIN shown on their PC.',
+            'Toggle receiving in the background, including after restarting Windows.'
+        ) -ZeroLabel 'Back'
+        switch ($pick) {
+            0 { Open-InboxFront }
+            1 { Show-ReceiveWithPin }
+            2 { Set-QuickReceive -On (-not (Test-QuickReceive)) }
+            default { return }
+        }
+    }
+}
+
+function Show-ReceiveWithPin {
     Clear-Host
     Write-Host 'Receive files' -ForegroundColor Cyan
     Write-Host ''
@@ -2983,7 +3101,7 @@ function Show-ReceiveFiles {
     Write-Host ''
     Write-Host 'Looking for a PC that is sending...'
     $shares = @(Receive-Beacons -Seconds 5 | Where-Object {
-        $_.Token -ne 'OPEN' -and $_.Token -ne 'QUICK' -and $_.Token -ne 'CHAT' -and $_.Port -gt 0 -and -not (Test-OwnAddress $_.IP)
+        $_.Token -match '^[a-fA-F0-9]{16}$' -and $_.Port -gt 0 -and -not (Test-OwnAddress $_.IP)
     })
     if ($shares.Count -eq 0) {
         Write-Host 'Nobody is sending right now. Start Send on the other PC, then try again.' -ForegroundColor Yellow
@@ -3020,7 +3138,7 @@ function Show-ReceiveFiles {
             $saved = Save-RemoteFile -Url $url -Directory (Get-InboxPath)
             Write-Host ''
             Write-Host "Saved to $saved" -ForegroundColor Green
-            Open-ContainingFolder $saved -Force
+            Open-ContainingFolder $saved
             Wait-Enter
             return
         } catch {
@@ -3064,7 +3182,7 @@ function Test-AutoChatListenerAlive {
     if (Test-Path -LiteralPath $path) {
         [void][int]::TryParse((Get-Content -LiteralPath $path -Raw -ErrorAction SilentlyContinue).Trim(), [ref]$chatPid)
     }
-    return ($chatPid -gt 0 -and $null -ne (Get-Process -Id $chatPid -ErrorAction SilentlyContinue))
+    return $null -ne (Get-SlipListenerProcess -ProcessId $chatPid -Entry 'chatlisten')
 }
 
 function Start-AutoChatListener {
@@ -3072,8 +3190,7 @@ function Start-AutoChatListener {
     if (-not (Test-Path -LiteralPath $scriptPath)) { return $false }
     Remove-Item -LiteralPath (Get-ChatPidPath) -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath (Get-ChatPortPath) -Force -ErrorAction SilentlyContinue
-    $arg = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`" chatlisten"
-    $proc = Start-Process -FilePath powershell.exe -ArgumentList $arg -WindowStyle Hidden -PassThru
+    $proc = Start-SlipBackground 'chatlisten'
     Write-TransferDebug 'chat.auto.started' @{ pid = $proc.Id; script = $scriptPath }
     return $true
 }
@@ -3217,7 +3334,7 @@ function Enable-AutoChat {
     Set-AutoChatFlag $true
     Install-SlipCommand
     $scriptPath = Get-InstalledScriptPath
-    $value = "`"powershell.exe`" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`" chatlisten"
+    $value = Get-BackgroundCommandLine 'chatlisten'
     $runPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
     try {
         if (-not (Test-Path -LiteralPath $runPath)) { New-Item -Path $runPath -Force | Out-Null }
@@ -3243,7 +3360,7 @@ function Stop-AutoChat {
     if (Test-Path -LiteralPath (Get-ChatPidPath)) {
         $chatPid = 0
         if ([int]::TryParse((Get-Content -LiteralPath (Get-ChatPidPath) -Raw -ErrorAction SilentlyContinue).Trim(), [ref]$chatPid)) {
-            Stop-Process -Id $chatPid -Force -ErrorAction SilentlyContinue
+            Stop-SlipListenerProcess -ProcessId $chatPid -Entry 'chatlisten'
         }
         Remove-Item -LiteralPath (Get-ChatPidPath) -Force -ErrorAction SilentlyContinue
     }
@@ -3554,8 +3671,7 @@ function Get-RemoteHelpReport {
 }
 
 function Get-RemoteHelpCommandLine {
-    $scriptPath = Get-InstalledScriptPath
-    return "`"powershell.exe`" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`" remotehelp"
+    return (Get-BackgroundCommandLine 'remotehelp')
 }
 
 function Test-RemoteHelpListenerAlive {
@@ -3564,7 +3680,7 @@ function Test-RemoteHelpListenerAlive {
     if (Test-Path -LiteralPath $path) {
         [void][int]::TryParse((Get-Content -LiteralPath $path -Raw -ErrorAction SilentlyContinue).Trim(), [ref]$listenerPid)
     }
-    return ($listenerPid -gt 0 -and $null -ne (Get-Process -Id $listenerPid -ErrorAction SilentlyContinue))
+    return $null -ne (Get-SlipListenerProcess -ProcessId $listenerPid -Entry 'remotehelp')
 }
 
 function Set-RemoteHelpRunKey {
@@ -3582,8 +3698,7 @@ function Enable-RemoteHelp {
     Set-RemoteHelpRunKey
     if (-not (Test-RemoteHelpListenerAlive)) {
         $scriptPath = Get-InstalledScriptPath
-        $arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`" remotehelp"
-        Start-Process -FilePath powershell.exe -ArgumentList $arguments -WindowStyle Hidden | Out-Null
+        Start-SlipBackground 'remotehelp' | Out-Null
     }
     if (-not $Quiet) { Write-Host 'Remote help is on.' -ForegroundColor Green }
 }
@@ -3592,8 +3707,7 @@ function Ensure-RemoteHelp {
     if (-not (Test-RemoteHelp) -or (Test-RemoteHelpListenerAlive)) { return }
     $scriptPath = Get-InstalledScriptPath
     if (-not (Test-Path -LiteralPath $scriptPath)) { return }
-    $arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`" remotehelp"
-    Start-Process -FilePath powershell.exe -ArgumentList $arguments -WindowStyle Hidden | Out-Null
+    Start-SlipBackground 'remotehelp' | Out-Null
 }
 
 function Stop-RemoteHelp {
@@ -3604,7 +3718,7 @@ function Stop-RemoteHelp {
     $listenerPid = 0
     if (Test-Path -LiteralPath (Get-RemoteHelpPidPath)) {
         [void][int]::TryParse((Get-Content -LiteralPath (Get-RemoteHelpPidPath) -Raw -ErrorAction SilentlyContinue).Trim(), [ref]$listenerPid)
-        if ($listenerPid -gt 0) { Stop-Process -Id $listenerPid -Force -ErrorAction SilentlyContinue }
+        if ($listenerPid -gt 0) { Stop-SlipListenerProcess -ProcessId $listenerPid -Entry 'remotehelp' }
     }
     Remove-Item -LiteralPath (Get-RemoteHelpPidPath) -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath (Get-RemoteHelpPortPath) -Force -ErrorAction SilentlyContinue
@@ -4130,8 +4244,7 @@ function Save-UpdateReminderState {
 }
 
 function Get-UpdateReminderCommandLine {
-    $scriptPath = Get-InstalledScriptPath
-    return "`"powershell.exe`" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`" updatecheck"
+    return (Get-BackgroundCommandLine 'updatecheck')
 }
 
 function Test-UpdateReminderTask {
@@ -4145,8 +4258,8 @@ function Register-UpdateReminderTask {
     $state = Get-UpdateReminderState
     if (-not $state.Enabled) { return $false }
     try {
-        $arguments = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" updatecheck' -f (Get-InstalledScriptPath)
-        $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $arguments
+        Install-BackgroundLauncher
+        $action = New-ScheduledTaskAction -Execute (Get-BackgroundLauncherPath) -Argument 'updatecheck'
         $trigger = New-ScheduledTaskTrigger -Daily -At $state.Time
         $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
         $userId = [Security.Principal.WindowsIdentity]::GetCurrent().Name
@@ -4217,7 +4330,7 @@ function Show-UpdateNotice {
     Write-Host ("Installed: {0}" -f $script:Version)
     Write-Host ("Available: {0}" -f $OnlineVersion) -ForegroundColor Green
     Write-Host ''
-    Write-Host 'Open Slip, then choose More > Diagnostics > Check and fix.'
+    Write-Host 'Open Slip, then choose Help & troubleshooting > Check and fix.'
     Write-Host 'The reminder never installs an update by itself.' -ForegroundColor DarkGray
     Wait-Enter
 }
@@ -4259,7 +4372,7 @@ function Show-UpdateReminderScreen {
             Write-Host ''
             if ($result.Status -eq 'available') {
                 Write-Host ("Slip {0} is available. Installed: {1}." -f $result.Online, $result.Installed) -ForegroundColor Green
-                Write-Host 'Use Diagnostics > Check and fix when you are ready.'
+                Write-Host 'Use Help & troubleshooting > Check and fix when you are ready.'
             } elseif ($result.Status -eq 'current') {
                 Write-Host ("Slip {0} is up to date." -f $result.Installed) -ForegroundColor Green
             } else {
@@ -4317,7 +4430,7 @@ function Repair-SlipStartupEntries {
     $runPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
     $scriptPath = Get-InstalledScriptPath
     if (Test-AutoChat) {
-        $expected = "`"powershell.exe`" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`" chatlisten"
+        $expected = Get-BackgroundCommandLine 'chatlisten'
         $have = $null
         try { $have = [string](Get-ItemPropertyValue -LiteralPath $runPath -Name (Get-ChatRunName) -ErrorAction Stop) } catch { }
         if ($have -ne $expected) {
@@ -4344,7 +4457,7 @@ function Repair-SlipStartupEntries {
         }
     }
     $updateState = Get-UpdateReminderState
-    if ($updateState.Enabled -and -not (Test-UpdateReminderTask)) {
+    if ($updateState.Enabled) {
         if (Register-UpdateReminderTask) { $fixed += 'Update reminder task' }
     }
     return @($fixed)
@@ -4395,7 +4508,7 @@ function Invoke-SlipSelfHeal {
         Write-HealResult 'warn' 'downloaded, but its version could not be read'
         Add-HealReport 'Update' 'warn' 'Online version unreadable'
     }
-    elseif ($online.Version -eq $script:Version) {
+    elseif (-not (Test-NewerSlipVersion -Online $online.Version -Installed $script:Version)) {
         Write-HealResult 'ok' ("already on {0}" -f $script:Version)
         Add-HealReport 'Update' 'ok' ("Latest ({0})" -f $script:Version)
     }
@@ -4552,37 +4665,47 @@ function Show-SelfHealScreen {
 
 function Show-DiagnosticsMenu {
     while ($true) {
-        $pick = Read-ArrowMenu -Title 'Diagnostics' -Lines @('Fix and check this PC, then names and logs.') -Items @(
-            'Check and fix (one click)',
-            'Status',
-            'Repair',
-            'Remove',
-            'Rename this PC',
-            'Open Debug folder',
-            'Chat log'
+        $pick = Read-ArrowMenu -Title 'Help & troubleshooting' -Items @(
+            'How to send and receive', 'Check connection', 'Check and fix (one click)', 'Status', 'Advanced tools'
         ) -Descriptions @(
-            'Update Slip, set the network to Private and fix the firewall in one go.',
-            'Show what is installed, running and listening on this PC.',
-            'Reinstall Slip on this PC and rebuild its shortcuts and launchers.',
-            'Uninstall Slip from this PC. Your Inbox and Outbox stay.',
-            'Change the name other PCs see for this PC.',
-            'Open the folder with Slip''s debug logs (send these when something fails).',
-            'Read the saved chat history.'
-        ) -SeparatorsAfter @(3) -ZeroLabel 'Back'
+            'Short instructions, including right-click > Send to > Slip.',
+            'Find other PCs and check whether they are reachable.',
+            'Check for updates and repair startup and network settings.',
+            'See this PC''s network, listeners and installation details.',
+            'Repair, logs and uninstall.'
+        ) -ZeroLabel 'Back'
         switch ($pick) {
-            0 { Show-SelfHealScreen }
-            1 { Show-Status }
-            2 { Show-RepairScreen }
-            3 { Invoke-RemoveSlip }
-            4 { Rename-ThisPc }
-            5 { Open-DebugFolder }
-            6 { Show-ChatLog }
+            0 { Show-HowTo }
+            1 { Show-CheckConnection }
+            2 { Show-SelfHealScreen }
+            3 { Show-Status }
+            4 { Show-AdvancedMenu }
             default { return }
         }
     }
 }
 
-function Show-MoreMenu {
+function Show-AdvancedMenu {
+    while ($true) {
+        $pick = Read-ArrowMenu -Title 'Advanced tools' -Items @(
+            'Repair installation', 'Open Debug folder', 'Chat history', 'Uninstall Slip'
+        ) -Descriptions @(
+            'Reinstall Slip on this PC and rebuild its shortcuts and launchers.',
+            'Open diagnostic logs.',
+            'Read the saved chat history.',
+            'Remove Slip after confirmation. Your Inbox and Outbox stay.'
+        ) -SeparatorsAfter @(2) -ZeroLabel 'Back'
+        switch ($pick) {
+            0 { Show-RepairScreen }
+            1 { Open-DebugFolder }
+            2 { Show-ChatLog }
+            3 { Invoke-RemoveSlip }
+            default { return }
+        }
+    }
+}
+
+function Show-SettingsMenu {
     while ($true) {
         $quickLabel = if (Test-QuickReceive) { 'Quick receive: On' } else { 'Quick receive: Off' }
         $chatLabel = if (Test-AutoChat) { 'Auto chat: On' } else { 'Auto chat: Off' }
@@ -4592,37 +4715,28 @@ function Show-MoreMenu {
         $active = @(Get-ActiveNetworkProfiles)
         $public = @(Get-PublicNetworkProfiles)
         $netLabel = if ($active.Count -eq 0) { 'Network: not connected' } elseif ($public.Count -gt 0) { 'Network: Public' } else { 'Network: Private' }
-        $pick = Read-ArrowMenu -Title 'More' -Lines @('Folders and help, then on/off switches, then diagnostics.') -Items @(
-            'Folders',
-            'How to send and receive',
-            'Check connection',
-            $updateLabel,
+        $pick = Read-ArrowMenu -Title 'Settings' -Items @(
             $quickLabel,
             $chatLabel,
+            ("PC name: {0}" -f (Get-DisplayName)),
             $netLabel,
-            $remoteLabel,
-            'Diagnostics'
+            $updateLabel,
+            $remoteLabel
         ) -Descriptions @(
-            'Open the Outbox (what you send) or the Inbox (what you receive).',
-            'A short how-to for sending and receiving between PCs.',
-            'Test whether another PC can be reached from this one.',
-            'Turn the daily update check on or off, or check now.',
-            'When on, other PCs can send to this PC without a PIN.',
-            'When on, chats from other PCs open here by themselves.',
-            'Private lets PCs on this network find each other. Public hides this PC.',
-            'Let the developer check this PC''s Slip status remotely.',
-            'Check and fix, status, repair, remove, rename and logs.'
-        ) -SeparatorsAfter @(3, 7) -ZeroLabel 'Back'
+            'Receive files without a PIN, even when the menu is closed. Select to toggle.',
+            'Allow incoming chats while the menu is closed. Select to toggle.',
+            'Change the name shown to other PCs.',
+            'Choose whether this network is trusted for local sharing.',
+            'Schedule a daily update reminder or check now.',
+            'Pair a trusted PC to request a health report.'
+        ) -ZeroLabel 'Back'
         switch ($pick) {
-            0 { Show-FoldersMenu }
-            1 { Show-HowTo }
-            2 { Show-CheckConnection }
-            3 { Show-UpdateReminderScreen }
-            4 { Set-QuickReceive -On (-not (Test-QuickReceive)) }
-            5 { Set-AutoChat -On (-not (Test-AutoChat)) }
-            6 { Show-NetworkToggle }
-            7 { Show-RemoteHelpScreen }
-            8 { Show-DiagnosticsMenu }
+            0 { Set-QuickReceive -On (-not (Test-QuickReceive)) }
+            1 { Set-AutoChat -On (-not (Test-AutoChat)) }
+            2 { Rename-ThisPc }
+            3 { Show-NetworkToggle }
+            4 { Show-UpdateReminderScreen }
+            5 { Show-RemoteHelpScreen }
             default { return }
         }
     }
@@ -4638,29 +4752,34 @@ function Show-SlipMenu {
         while ($true) {
             $ips = @(Get-LanIPv4)
             $ipText = if ($ips.Count -gt 0) { $ips[0] } else { 'no LAN address' }
-            $outCount = @(Get-OutboxItems).Count
             $chatState = if (Test-AutoChat) { 'Auto chat on' } else { 'Auto chat off' }
+            $receiveState = if (Test-QuickReceive) { 'Quick receive on' } else { 'Quick receive off' }
             $zero = if ($CanReturn) { 'Back' } else { 'Quit' }
             $pick = Read-ArrowMenu -Title $script:AppName -Lines @(
                 ("{0}    {1}" -f (Get-DisplayName), $ipText),
-                ("Outbox {0}    {1}" -f $outCount, $chatState),
-                '----------------------------------------'
+                ("{0}    {1}" -f $receiveState, $chatState)
             ) -Items @(
                 'Send files',
                 'Receive files',
                 'Chat',
-                'More'
+                'Folders',
+                'Settings',
+                'Help & troubleshooting'
             ) -Descriptions @(
                 'Send what is in your Outbox to another PC on this network.',
-                'Download files another PC is sending to you.',
+                'Open Inbox, receive with a PIN, or enable Quick receive.',
                 'Chat with another PC that has Slip.',
-                'Folders, switches, help and diagnostics.'
-            ) -SeparatorsAfter @(1, 2) -ZeroLabel $zero
+                'Open received files or add files to your Outbox.',
+                'Automatic receiving, chat, PC name and network preferences.',
+                'Instructions, connection checks and repair tools.'
+            ) -ZeroLabel $zero
             switch ($pick) {
                 0 { Show-SendFiles }
                 1 { Show-ReceiveFiles }
                 2 { Show-StartChat }
-                3 { Show-MoreMenu }
+                3 { Show-FoldersMenu }
+                4 { Show-SettingsMenu }
+                5 { Show-DiagnosticsMenu }
                 default { return }
             }
         }
@@ -5522,7 +5641,7 @@ switch ($script:Opt.Entry) {
                 $saved = Save-RemoteFile -Url $url -Directory $destDir -Quiet
                 [Console]::Out.WriteLine($saved)
                 if (-not $script:Opt.Quiet) {
-                    Open-ContainingFolder $saved -Force
+                    Open-ContainingFolder $saved
                 }
                 Exit-Slip 0
             } catch {
@@ -5614,7 +5733,7 @@ switch ($script:Opt.Entry) {
             Write-Host ''
             Write-Host 'That PC started the chat, but this PC could not connect back to it.'
             Write-Host 'Usually that PC is on a Public network, or its firewall is blocking the chat port.'
-            Write-Host 'On that PC: Slip > More > Diagnostics > Check and fix, and set the network to Private.' -ForegroundColor DarkGray
+            Write-Host 'On that PC: Slip > Help & troubleshooting > Check and fix.' -ForegroundColor DarkGray
             Write-Host ''
             Write-Host ("Detail: {0}" -f $_.Exception.Message) -ForegroundColor DarkGray
             Write-Host ''
